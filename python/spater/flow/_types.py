@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 import collections.abc
 import dataclasses
+import datetime
 import enum
 import importlib
 import inspect
 import sys
 import types
 import typing
+import uuid
 from typing import Any, NoReturn, TypeGuard
 
 
@@ -25,8 +27,8 @@ def assert_never(value: NoReturn) -> NoReturn:
 
 
 NoneType = type(None)
-_OPAQUE = (dict, tuple, set, frozenset)
-_JSON_SCALARS = (NoneType, str, int, float, bool, dict, list)
+_OPAQUE = (dict, tuple, set, frozenset, collections.abc.Sequence, collections.abc.Mapping)
+_JSON_SCALARS = (NoneType, str, int, float, bool, dict, list, uuid.UUID, datetime.datetime, datetime.date)
 
 
 class Unsupported(Exception):

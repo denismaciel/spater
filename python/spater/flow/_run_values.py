@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import collections.abc
 import copy
 import dataclasses
+import datetime
 import enum
 import inspect
 import json
@@ -11,6 +13,7 @@ import math
 import re
 import types
 import typing
+import uuid
 from collections import deque
 from typing import Any
 
@@ -210,10 +213,41 @@ class _Codec:
             return self.value(value, normalize(atom.__supertype__), _child(path, "@supertype"))
         if type(atom) is not type:
             origin = typing.get_origin(atom)
-            if origin is dict:
+            if origin in (dict, collections.abc.Mapping):
                 return self.mapping(value, typing.get_args(atom), path)
-            if origin in (tuple, set, frozenset):
+            if origin in (tuple, set, frozenset, collections.abc.Sequence):
                 return self.sequence(value, origin, typing.get_args(atom), path)
+        if atom is uuid.UUID:
+            if self.reading:
+                _require(isinstance(value, str), path, "expected UUID string")
+                try:
+                    return uuid.UUID(value)
+                except ValueError as exc:
+                    raise RunValueError(f"{path or '/'}: invalid UUID {value!r}") from exc
+            _require(isinstance(value, uuid.UUID), path, f"expected UUID, got {type(value).__name__}")
+            return str(value)
+        if atom is datetime.datetime:
+            if self.reading:
+                _require(isinstance(value, str), path, "expected ISO datetime string")
+                try:
+                    return datetime.datetime.fromisoformat(value)
+                except ValueError as exc:
+                    raise RunValueError(f"{path or '/'}: invalid datetime {value!r}") from exc
+            _require(isinstance(value, datetime.datetime), path, f"expected datetime, got {type(value).__name__}")
+            return value.isoformat()
+        if atom is datetime.date:
+            if self.reading:
+                _require(isinstance(value, str), path, "expected ISO date string")
+                try:
+                    return datetime.date.fromisoformat(value)
+                except ValueError as exc:
+                    raise RunValueError(f"{path or '/'}: invalid date {value!r}") from exc
+            _require(
+                isinstance(value, datetime.date) and not isinstance(value, datetime.datetime),
+                path,
+                f"expected date, got {type(value).__name__}",
+            )
+            return value.isoformat()
         if dataclasses.is_dataclass(atom):
             return self.record(value, atom, path)
         if issubclass(atom, enum.Flag):
@@ -286,7 +320,16 @@ class _Codec:
         return record
 
     def sequence(self, value: Any, origin: type, args: tuple[Any, ...], path: str) -> Any:
-        _require(isinstance(value, list if self.reading else origin), path, f"expected {origin.__name__}")
+        if origin is collections.abc.Sequence:
+            _require(
+                isinstance(value, list)
+                if self.reading
+                else (isinstance(value, collections.abc.Sequence) and not isinstance(value, (str, bytes, bytearray))),
+                path,
+                "expected Sequence",
+            )
+        else:
+            _require(isinstance(value, list if self.reading else origin), path, f"expected {origin.__name__}")
         if not self.reading and origin in (set, frozenset):
             return self.unordered(value, normalize(args[0]), path)
         fixed_tuple = origin is tuple and (not args or args[-1] is not Ellipsis)
@@ -297,6 +340,8 @@ class _Codec:
             for i, item in enumerate(value)
         ]
         if self.reading:
+            if origin is collections.abc.Sequence:
+                return result
             restored = origin(result)
             _require(len(restored) == len(result), path, "duplicate set member")
             if self.legacy_tags is not None and origin in (set, frozenset):
@@ -329,7 +374,12 @@ class _Codec:
     def mapping(self, value: Any, args: tuple[Any, ...], path: str) -> Any:
         key_type, item_type = args
         if key_type is str:
-            _require(isinstance(value, dict) and all(isinstance(k, str) for k in value), path, "expected string keys")
+            _require(
+                isinstance(value, dict if self.reading else collections.abc.Mapping)
+                and all(isinstance(k, str) for k in value),
+                path,
+                "expected string keys",
+            )
             result = {}
             for k, v in value.items():
                 key = str.__str__(k)
