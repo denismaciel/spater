@@ -869,8 +869,10 @@ class _Execution:
         result = await self.scope(job, identity, arm_scope, arm_env)
         if isinstance(result, Parked):
             return result
-        if result is None or node.returns is None or node.returns == Ty.of(NoneType):
+        if result is None or node.returns is None:
             return None
+        if node.returns == Ty.of(NoneType):
+            return Stored(node.returns, encode(None, node.returns))
         value = decode(result.encoded, result.ty)
         return Stored(node.returns, encode(value, node.returns))
 
