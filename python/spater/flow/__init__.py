@@ -24,6 +24,7 @@ from ._nodes import (
     Builder,
     DuplicatePolicy,
     FlowError,
+    FlowFailure,
     Job,
     PerStep,
     PerWorker,
@@ -32,21 +33,25 @@ from ._nodes import (
     Retry,
     RunExistsError,
 )
+from ._ops import ApiError, Operations
 from ._run_queue import FlowQueue
 from ._runner import Failed, Runner, Succeeded
 
 __all__ = [
+    "ApiError",
     "Builder",
     "Context",
     "DuplicatePolicy",
     "Failed",
     "FlowError",
+    "FlowFailure",
     "FlowQueue",
     "Graph",
     "GraphEdge",
     "GraphNode",
     "Job",
     "LocalExecutor",
+    "Operations",
     "PerStep",
     "PerWorker",
     "Problem",

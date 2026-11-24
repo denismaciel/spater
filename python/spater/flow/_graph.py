@@ -12,6 +12,7 @@ from typing import Any
 from ._nodes import (
     Job,
     _BranchNode,
+    _CallNode,
     _FailNode,
     _MapNode,
     _Scope,
@@ -83,6 +84,7 @@ _MERMAID_SHAPES = {
     "sleep": ("{{", "}}"),
     "decide": ("{", "}"),
     "map": ("[[", "]]"),
+    "call": ("[[", "]]"),
     "fail": ("([", "])"),
 }
 
@@ -93,6 +95,7 @@ _DOT_SHAPES = {
     "sleep": "shape=hexagon",
     "decide": "shape=diamond",
     "map": "shape=box3d",
+    "call": "shape=box3d",
     "fail": "shape=oval, color=red, fontcolor=red",
 }
 
@@ -137,6 +140,11 @@ def project(job: Job[Any, Any]) -> Graph:
                     exits_by_id[node.id] = [(node.id, None)]
                 case _MapNode():
                     nodes.append(GraphNode(node.id, "map", f"{node.id} ⇉ {node.job.name}"))
+                    for src, lbl in incoming:
+                        add_edge(src, node.id, lbl)
+                    exits_by_id[node.id] = [(node.id, None)]
+                case _CallNode():
+                    nodes.append(GraphNode(node.id, "call", f"{node.id} → {node.job.name}"))
                     for src, lbl in incoming:
                         add_edge(src, node.id, lbl)
                     exits_by_id[node.id] = [(node.id, None)]

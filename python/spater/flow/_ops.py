@@ -11,7 +11,7 @@ import math
 import os
 import sys
 import typing
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict
 from itertools import chain, islice
 from typing import Any, TextIO
@@ -205,7 +205,7 @@ def _node_details(scope: Record) -> Iterator[Record]:
             if isinstance(dur, dict) and "fn" in dur:
                 info["callable"] = dur["fn"]
             yield info
-        elif kind == "map":
+        elif kind in ("map", "call"):
             info["callable"] = node["job"]["name"]
             yield info
         elif kind == "branch":
@@ -305,34 +305,68 @@ def _comparison(source: Record, current: Record, before: list[Record], after: li
 
 
 class Operations:
-    def __init__(self, url: str, jobs: Sequence[Job[Any, Any]]):
+    def __init__(
+        self,
+        url: str,
+        jobs: Sequence[Job[Any, Any]],
+        *,
+        queue: str = QUEUE,
+        queues: Mapping[str, str] | None = None,
+        flow_queue: FlowQueue | None = None,
+        with_worker: bool = True,
+    ):
         self.jobs = {job.name: job for job in jobs}
         if len(self.jobs) != len(jobs):
             raise ValueError("workflow registry contains duplicate names")
-        self.app = Asynq(url)
-        self.queue = FlowQueue(self.app, jobs)
+        self._queue_name = queue
+        self._queues = dict(queues) if queues is not None else {}
+        self._owns_queue = flow_queue is None
+        if flow_queue is not None:
+            self.queue = flow_queue
+            self.app = flow_queue._app
+            self._with_worker = False
+        else:
+            self.app = Asynq(url)
+            self.queue = FlowQueue(self.app, jobs)
+            self._with_worker = with_worker
         self.store = self.queue.runner.store
-        self.worker = self.app.worker(
-            queues=[QUEUE], install_signal_handlers=False, task_check_interval=0.1, delayed_task_check_interval=0.25
+        self.worker = (
+            self.app.worker(
+                queues=sorted({self._queue_name, *self._queues.values()}),
+                install_signal_handlers=False,
+                task_check_interval=0.1,
+                delayed_task_check_interval=0.25,
+            )
+            if self._with_worker
+            else None
         )
         self.worker_task: asyncio.Task[None] | None = None
 
+    def _queue_for(self, job_name: str) -> str:
+        return self._queues.get(job_name, self._queue_name)
+
     async def __aenter__(self) -> Self:
-        self.worker_task = asyncio.create_task(self.worker.run())
-        while self.worker.status != "active":
-            if self.worker_task.done():
-                self.worker_task.result()
-                raise RuntimeError("operations worker stopped during startup")
-            await asyncio.sleep(0.01)
+        if self.worker is not None:
+            self.worker_task = asyncio.create_task(self.worker.run())
+            while self.worker.status != "active":
+                if self.worker_task.done():
+                    self.worker_task.result()
+                    raise RuntimeError("operations worker stopped during startup")
+                await asyncio.sleep(0.01)
         return self
 
     async def __aexit__(self, *exc: object) -> None:
-        self.worker.shutdown()
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        if self.worker is not None:
+            self.worker.shutdown()
         try:
             if self.worker_task:
                 await self.worker_task
         finally:
-            await self.queue.aclose()
+            if self._owns_queue:
+                await self.queue.aclose()
 
     async def run(self, id: str) -> Record:
         try:
@@ -366,9 +400,14 @@ class Operations:
         return data
 
     async def _pending(self, id: str) -> Record | None:
-        try:
-            info = await self.app.inspector.aget_task_info(QUEUE, id)
-        except (TaskNotFoundError, QueueNotFoundError):
+        info = None
+        for queue_name in dict.fromkeys((self._queue_name, *self._queues.values())):
+            try:
+                info = await self.app.inspector.aget_task_info(queue_name, id)
+                break
+            except (TaskNotFoundError, QueueNotFoundError):
+                continue
+        if info is None:
             return None
         if info.type != self.queue._task.name:
             return None
@@ -526,9 +565,24 @@ class Operations:
             raise ApiError(422, f"Stored input is incompatible with the registered definition: {exc}") from exc
         return await self._enqueue(job, value, rerun_of=id)
 
+    async def cancel(self, id: str) -> Record:
+        try:
+            row = await self.store.get(id)
+        except KeyError:
+            pending = await self._pending(id)
+            if pending is None:
+                raise ApiError(404, f"Run {id!r} was not found") from None
+            queue_name = self._queue_for(pending["run"]["workflow"])
+            await self.queue.cancel(id, queue=queue_name)
+            return {"run": {**pending["run"], "status": "cancelled"}}
+        queue_name = row.get("broker_queue") or self._queue_for(row["job"])
+        await self.queue.cancel(id, queue=queue_name)
+        updated = await self.store.get(id)
+        return {"run": _summary(updated)}
+
     async def _enqueue(self, job: Job[Any, Any], value: Any, rerun_of: str | None = None) -> Record:
         try:
-            run_id = await self.queue._enqueue(job, input=value, queue=QUEUE, rerun_of=rerun_of)
+            run_id = await self.queue._enqueue(job, input=value, queue=self._queue_for(job.name), rerun_of=rerun_of)
         except FlowError as exc:
             raise ApiError(409, str(exc)) from exc
         except RunValueError as exc:
@@ -536,7 +590,7 @@ class Operations:
         return {"run_id": run_id}
 
     async def dispatch(self, request: Any) -> Record:
-        operations = {"list_runs", "run", "children", "workflows", "workflow", "launch", "rerun"}
+        operations = {"list_runs", "run", "children", "workflows", "workflow", "launch", "rerun", "cancel"}
         try:
             if (
                 not isinstance(request, dict)

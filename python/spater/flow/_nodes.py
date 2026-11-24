@@ -67,6 +67,15 @@ class PerStep:
 
 
 @dataclass(frozen=True)
+class FlowFailure:
+    """Failure details injected into a job's `on_fail` compensation step."""
+
+    run_id: str
+    node_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class Retry:
     """Retry a step on matching raised exceptions or returned domain outcomes."""
 
@@ -74,11 +83,24 @@ class Retry:
     max: int
     after: timedelta
     backoff: float = 1.0
+    max_delay: timedelta | None = None
+    unless: type[Exception] | tuple[type[Exception], ...] | Callable[[Exception], bool] | None = None
+    defer: Callable[[Exception], timedelta | None] | None = None
+    max_defer: int = 100
 
     def targets(self) -> tuple[type[Any], ...]:
         if isinstance(self.on, tuple):
             return self.on
         return (self.on,)
+
+    def is_excluded(self, exc: Exception) -> bool:
+        if self.unless is None:
+            return False
+        if isinstance(self.unless, tuple):
+            return isinstance(exc, self.unless)
+        if isinstance(self.unless, type):
+            return isinstance(exc, self.unless)
+        return bool(self.unless(exc))
 
 
 @dataclass(frozen=True)
@@ -165,6 +187,16 @@ class _FailNode:
 
 
 @dataclass(frozen=True)
+class _CallNode:
+    id: str
+    job: Job[Any, Any]
+    arg: Ref[Any] | None
+    after: tuple[str, ...]
+    deps: tuple[str, ...]
+    returns: Ty
+
+
+@dataclass(frozen=True)
 class _BranchNode:
     id: str
     subject: Ref[Any]
@@ -174,7 +206,7 @@ class _BranchNode:
     returns: Ty | None
 
 
-_Node = _StepNode | _MapNode | _SleepNode | _FailNode | _BranchNode
+_Node = _StepNode | _MapNode | _CallNode | _SleepNode | _FailNode | _BranchNode
 
 
 @dataclass(frozen=True)
@@ -196,6 +228,7 @@ class _BuildState:
         self.provider_entries: tuple[PerWorker | PerStep, ...] = ()
         self._scope_seq = 0
         self._fail_seq = 0
+        self.on_fail: _StepNode | None = None
         self._check_providers(provides)
 
     def add(self, code: str, where: str, message: str) -> None:
@@ -326,6 +359,7 @@ class Builder:
         where: str,
         *,
         allow_providers: bool,
+        allow_failure: bool = False,
         pure_error_code: str = "bad-duration",
     ) -> tuple[tuple[tuple[str, Ref[Any]], ...], list[str]]:
         if kwargs is not None and not isinstance(kwargs, Mapping):
@@ -373,6 +407,8 @@ class Builder:
                 ref_arg = bound[param.name]
                 if not assignable(ref_arg._ty, param.ty):
                     self._state.add("type-mismatch", where, f"{label} cannot accept {ref_arg._label} ({ref_arg._ty})")
+                continue
+            if allow_failure and assignable(Ty.of(FlowFailure), param.ty):
                 continue
             matching_providers = [ty for ty in self._state.providers if assignable(ty, param.ty)]
             if allow_providers:
@@ -560,6 +596,153 @@ class Builder:
             or (isinstance(retry.backoff, float) and not math.isfinite(retry.backoff))
         ):
             self._state.add("bad-option", where, "retry.backoff must be a finite number at least 1")
+        if retry.max_delay is not None:
+            self._state.positive(retry.max_delay, where, "retry.max_delay")
+        if retry.unless is not None:
+            if isinstance(retry.unless, tuple):
+                if not retry.unless or not all(plain_class(c) and issubclass(c, Exception) for c in retry.unless):
+                    self._state.add("bad-retry", where, "retry.unless tuple must contain Exception classes")
+            elif plain_class(retry.unless):
+                if not issubclass(retry.unless, Exception):
+                    self._state.add("bad-retry", where, "retry.unless class must be an Exception subclass")
+            elif not callable(retry.unless) or getattr(retry.unless, "__name__", None) == "<lambda>":
+                self._state.add("bad-retry", where, "retry.unless must be an Exception class, tuple, or named function")
+        if retry.defer is not None and (
+            not callable(retry.defer)
+            or isinstance(retry.defer, type)
+            or getattr(retry.defer, "__name__", None) == "<lambda>"
+        ):
+            self._state.add("bad-retry", where, "retry.defer must be a named function")
+        if type(retry.max_defer) is not int or retry.max_defer < 1:
+            self._state.add("bad-option", where, "retry.max_defer must be a positive integer")
+
+    @overload
+    def call(
+        self,
+        job: Job[None, None],
+        arg: None = None,
+        *,
+        name: str | None = None,
+        after: After = None,
+    ) -> Ref[None]: ...
+
+    @overload
+    def call(
+        self,
+        job: Job[None, ChildOutT],
+        arg: None = None,
+        *,
+        name: str | None = None,
+        after: After = None,
+    ) -> Ref[ChildOutT]: ...
+
+    @overload
+    def call(
+        self,
+        job: Job[ItemT, None],
+        arg: Ref[ItemT],
+        *,
+        name: str | None = None,
+        after: After = None,
+    ) -> Ref[None]: ...
+
+    @overload
+    def call(
+        self,
+        job: Job[ItemT, ChildOutT],
+        arg: Ref[ItemT],
+        *,
+        name: str | None = None,
+        after: After = None,
+    ) -> Ref[ChildOutT]: ...
+
+    def call(
+        self,
+        job: Job[Any, Any],
+        arg: Ref[Any] | None = None,
+        *,
+        name: str | None = None,
+        after: After = None,
+    ) -> Ref[Any]:
+        """Run a single child invocation of `job` and return its output Ref."""
+        fallback = f"call_{job.name}" if isinstance(job, Job) else "call"
+        node_id = self._state.register_name(name, fallback)
+        self._check_reachable(node_id)
+        if not isinstance(job, Job):
+            self._state.add("bad-option", node_id, f"call needs a Job to run, got {job!r}")
+            return self._ref(node_id, Ty.of(NoneType), node_id)
+        after_ids, after_deps = self._collect_after(after, node_id)
+        deps: list[str] = []
+        checked_arg: Ref[Any] | None = None
+        if job.input is None:
+            if arg is not None:
+                self._state.add("bad-input", node_id, f"child job {job.name!r} takes no input")
+        else:
+            if arg is None:
+                self._state.add("missing-input", node_id, f"child job {job.name!r} requires {describe(job.input)}")
+            else:
+                checked_arg = self._check_ref(arg, node_id, "arg")
+                if checked_arg is not None:
+                    if checked_arg._scope == self._scope_id and checked_arg._source not in ("$input", "$case"):
+                        deps.append(checked_arg._source)
+                    if not assignable(checked_arg._ty, normalize(job.input)):
+                        self._state.add(
+                            "type-mismatch",
+                            node_id,
+                            f"child job {job.name!r} expects {normalize(job.input)}, got {checked_arg._ty}",
+                        )
+        deps.extend(after_deps)
+        returns = Ty.of(NoneType) if job.output is None else normalize(job.output)
+        self._nodes.append(
+            _CallNode(
+                id=node_id,
+                job=job,
+                arg=checked_arg,
+                after=after_ids,
+                deps=tuple(dict.fromkeys(deps)),
+                returns=returns,
+            )
+        )
+        return self._ref(node_id, returns, node_id)
+
+    def on_fail(
+        self,
+        fn: Callable[..., Any],
+        *args: Ref[Any],
+        kwargs: Mapping[str, Ref[Any]] | None = None,
+        name: str | None = None,
+        timeout: timedelta | None = None,
+    ) -> None:
+        """Register a durable compensation step run when any node in this job fails."""
+        fallback = str(getattr(fn, "__name__", "on_fail"))
+        node_id = self._state.register_name(name, fallback)
+        if self._scope_id != 0:
+            self._state.add("bad-option", node_id, "on_fail may only be declared at the root scope of a job")
+            return
+        if self._state.on_fail is not None:
+            self._state.add("bad-option", node_id, "a job may declare at most one on_fail handler")
+            return
+        if timeout is not None:
+            self._state.positive(timeout, node_id, "timeout")
+        sig = self._state.sig(fn, node_id)
+        bound: tuple[tuple[str, Ref[Any]], ...] = ()
+        if sig is not None:
+            bound, arg_deps = self._bind_call(sig, args, kwargs, node_id, allow_providers=True, allow_failure=True)
+            if arg_deps:
+                self._state.add(
+                    "bad-input", node_id, "on_fail arguments may only reference job input, not step outputs"
+                )
+        self._state.on_fail = _StepNode(
+            id=node_id,
+            fn=fn,
+            bound=bound,
+            after=(),
+            deps=(),
+            retry=None,
+            timeout=timeout,
+            catch=(),
+            returns=Ty.of(NoneType),
+        )
 
     @overload
     def map(
@@ -935,6 +1118,7 @@ def _build_job(
         provides=state.provider_entries,
         _root=root,
         _signatures=state.signatures,
+        _on_fail=state.on_fail,
     )
 
 
@@ -964,6 +1148,7 @@ class Job(Generic[InT, OutT]):
     provides: tuple[PerWorker | PerStep, ...]
     _root: _Scope = field(repr=False, compare=False)
     _signatures: Signatures = field(repr=False, compare=False)
+    _on_fail: _StepNode | None = field(default=None, repr=False, compare=False)
     _definition_json: str = field(init=False, repr=False, compare=False)
     _digest: str = field(init=False, repr=False, compare=False)
     _graph_cache: Graph | None = field(init=False, default=None, repr=False, compare=False)

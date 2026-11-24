@@ -12,7 +12,7 @@ from typing import Any
 
 from spater.context import Context
 
-from ._nodes import Job, PerStep, PerWorker, Ref
+from ._nodes import FlowFailure, Job, PerStep, PerWorker, Ref
 from ._run_tasks import settle
 from ._run_values import decode
 from ._types import Sig, Ty, assignable
@@ -89,13 +89,19 @@ class Providers:
         *,
         allow_providers: bool,
         deadline: float | None = None,
+        failure: FlowFailure | None = None,
     ) -> Any:
         # asyncio.wait distinguishes a cancelled application awaitable from
         # cancellation of the owning DAG (including on Python 3.10).
         remaining = None if deadline is None else deadline - time.time()
         if remaining is not None and remaining <= 0:
             raise TimeoutError("step deadline elapsed")
-        work = asyncio.create_task(self._call(fn, job, bound, env, context, allow_providers=allow_providers))
+        coro = (
+            self._call(fn, job, bound, env, context, allow_providers=allow_providers)
+            if failure is None
+            else self._call(fn, job, bound, env, context, allow_providers=allow_providers, failure=failure)
+        )
+        work = asyncio.create_task(coro)
         try:
             done, _ = await asyncio.wait((work,), timeout=remaining)
             if not done or (deadline is not None and time.time() >= deadline):
@@ -117,6 +123,7 @@ class Providers:
         context: Context,
         *,
         allow_providers: bool,
+        failure: FlowFailure | None = None,
     ) -> Any:
         sig = job._signatures.get(fn)
         bound_map = dict(bound)
@@ -128,6 +135,8 @@ class Providers:
                 ref = bound_map[param.name]
                 stored = env[(ref._scope, ref._source)]
                 value = decode(stored.encoded, stored.ty)
+            elif failure is not None and assignable(Ty.of(FlowFailure), param.ty):
+                value = failure
             else:
                 providers = (
                     [p for p in job.provides if assignable(job._signatures.get(p.fn, provider=True).returns, param.ty)]

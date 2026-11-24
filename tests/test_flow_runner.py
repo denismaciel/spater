@@ -786,3 +786,81 @@ async def test_aclose_detaches_flow_queue_hooks_and_clears_runner_inspector(memo
     assert queue._reconcile not in app._worker_maintenance
     assert "spater.flow.deliver" not in app.tasks
     assert queue.runner._inspector is None
+
+
+async def test_subflow_call_on_fail_and_retry_unless_defer(url):
+    from spater.flow import FlowFailure, Operations
+
+    class PermanentBoomError(Exception):
+        pass
+
+    class DeferredError(Exception):
+        def __init__(self, delay: timedelta) -> None:
+            super().__init__("rate limited")
+            self.delay = delay
+
+    def is_permanent(exc: Exception) -> bool:
+        return isinstance(exc, PermanentBoomError)
+
+    def defer_rate_limit(exc: Exception) -> timedelta | None:
+        return exc.delay if isinstance(exc, DeferredError) else None
+
+    attempts = 0
+    failed_records: list[tuple[int, str, str]] = []
+
+    def flaky(n: int) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise DeferredError(timedelta(microseconds=10))
+        if attempts == 3:
+            raise TimeoutError("transient")
+        if n < 0:
+            raise PermanentBoomError("do not retry")
+        return n * 3
+
+    def record_failure(n: int, failure: FlowFailure) -> None:
+        failed_records.append((n, failure.node_id, failure.reason))
+
+    @Job.define("child_subflow")
+    def child(f: Builder, n: Ref[int]) -> Ref[int]:
+        f.on_fail(record_failure, n)
+        return f.step(
+            flaky,
+            n,
+            retry=Retry(
+                on=Exception,
+                max=2,
+                after=timedelta(microseconds=10),
+                max_delay=timedelta(milliseconds=1),
+                unless=is_permanent,
+                defer=defer_rate_limit,
+            ),
+        )
+
+    @Job.define("parent_subflow")
+    def parent(f: Builder, n: Ref[int]) -> Ref[int]:
+        return f.call(child, n)
+
+    async with Runner(url) as r:
+        ok = await r.run(parent, 7)
+        assert isinstance(ok, Succeeded) and ok.value == 21
+        assert attempts == 4  # 2 deferrals + 1 business retry + 1 success (deferrals didn't spend retry.max=2)
+        assert failed_records == []
+        assert len((await r.inspect(ok.run_id))["children"]) == 1
+
+        attempts = 3  # jump straight to permanent failure
+        bad = await r.run(parent, -1)
+        assert isinstance(bad, Failed) and "do not retry" in bad.reason
+        assert attempts == 4  # did NOT retry PermanentBoomError
+        assert len(failed_records) == 1
+        assert failed_records[0][0] == -1 and failed_records[0][1] == "flaky"
+
+    ops = Operations(url, [parent, child], queue="default", with_worker=False)
+    try:
+        catalog = await ops.workflows()
+        assert {w["name"] for w in catalog["items"]} >= {"parent_subflow", "child_subflow"}
+        detail = await ops.workflow("parent_subflow")
+        assert any(n["kind"] == "call" for n in detail["graph"]["nodes"])
+    finally:
+        await ops.aclose()

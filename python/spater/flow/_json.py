@@ -10,6 +10,7 @@ from ._nodes import (
     Job,
     PerWorker,
     _BranchNode,
+    _CallNode,
     _FailNode,
     _MapNode,
     _Node,
@@ -24,7 +25,7 @@ FORMAT = 3
 
 def job_to_dict(job: Job[Any, Any]) -> dict[str, Any]:
     sigs = job._signatures
-    return {
+    data: dict[str, Any] = {
         "spater_flow": FORMAT,
         "name": job.name,
         "input": _boundary(job.input),
@@ -35,6 +36,9 @@ def job_to_dict(job: Job[Any, Any]) -> dict[str, Any]:
         ],
         "scope": _scope(job._root, sigs),
     }
+    if job._on_fail is not None:
+        data["on_fail"] = _node(job._on_fail, sigs)
+    return data
 
 
 def _boundary(annotation: Any) -> Any:
@@ -83,6 +87,25 @@ def _node(node: _Node, sigs: Signatures) -> dict[str, Any]:
     match node:
         case _StepNode():
             retry = node.retry
+            retry_dict: dict[str, Any] | None = None
+            if retry is not None:
+                retry_dict = {
+                    "on": [ref(t) if t is not NoneType else "none" for t in retry.targets()],
+                    "max": retry.max,
+                    "after": _duration(retry.after),
+                    "backoff": retry.backoff,
+                }
+                if retry.max_delay is not None:
+                    retry_dict["max_delay"] = _duration(retry.max_delay)
+                if retry.unless is not None:
+                    if isinstance(retry.unless, tuple):
+                        retry_dict["unless"] = [ref(c) for c in retry.unless]
+                    else:
+                        retry_dict["unless"] = ref(retry.unless)
+                if retry.defer is not None:
+                    retry_dict["defer"] = ref(retry.defer)
+                if retry.max_defer != 100:
+                    retry_dict["max_defer"] = retry.max_defer
             out: dict[str, Any] = {
                 "kind": "step",
                 "id": node.id,
@@ -91,19 +114,21 @@ def _node(node: _Node, sigs: Signatures) -> dict[str, Any]:
                 "after": list(node.after),
                 "deps": list(node.deps),
                 "timeout": _duration(node.timeout),
-                "retry": None
-                if retry is None
-                else {
-                    "on": [ref(t) if t is not NoneType else "none" for t in retry.targets()],
-                    "max": retry.max,
-                    "after": _duration(retry.after),
-                    "backoff": retry.backoff,
-                },
+                "retry": retry_dict,
                 "catch": [{"exception": ref(exc), "to": _fn(conv, sigs)} for exc, conv in node.catch],
             }
             if node.meta:
                 out["meta"] = dict(node.meta)
             return out
+        case _CallNode():
+            return {
+                "kind": "call",
+                "id": node.id,
+                "arg": None if node.arg is None else node.arg._source,
+                "job": job_to_dict(node.job),
+                "after": list(node.after),
+                "deps": list(node.deps),
+            }
         case _MapNode():
             return {
                 "kind": "map",

@@ -21,9 +21,11 @@ from ._executor import LocalExecutor, StepCall, StepErrorHandler, StepExecutor, 
 from ._graph import Graph, GraphEdge, GraphNode
 from ._nodes import (
     DuplicatePolicy,
+    FlowFailure,
     Job,
     RunExistsError,
     _BranchNode,
+    _CallNode,
     _FailNode,
     _MapNode,
     _Node,
@@ -473,7 +475,9 @@ class _Execution:
             else:
                 value = decode(final.encoded, final.ty)
             encoded = encode(value, output_ty)
-        except _Failure:
+        except _Failure as failure:
+            if job._on_fail is not None:
+                await self._run_on_fail(job, identity, job._on_fail, env, failure)
             self._attempts.pop(identity, None)
             if identity != self.owner[0]:
                 raise
@@ -598,6 +602,51 @@ class _Execution:
             return None
         return env[(scope.output._scope, scope.output._source)]
 
+    async def _run_on_fail(
+        self,
+        job: Job[Any, Any],
+        identity: str,
+        node: _StepNode,
+        env: Env,
+        failure: _Failure,
+    ) -> None:
+        row = self._cached_attempt(identity, node.id, 1)
+        if row is not None and row["status"] == "succeeded":
+            return
+        if row is None:
+            row = {
+                "status": "running",
+                "started_at": self.clock(),
+                "input_preview": preview({"value": stored_inputs(node.bound, env)}, self.runner.preview_bytes),
+            }
+            if node.timeout is not None:
+                row["deadline"] = time.time() + node.timeout.total_seconds()
+            await self.put(identity, node.id, 1, **row)
+        raw_deadline = row.get("deadline")
+        deadline = float(raw_deadline) if isinstance(raw_deadline, (int, float)) else None
+        step_call = StepCall(
+            job=job,
+            run_id=identity,
+            node_id=node.id,
+            attempt=1,
+            fn=node.fn,
+            bound=node.bound,
+            env=env,
+            allow_providers=True,
+            deadline=deadline,
+            meta=node.meta,
+            failure=FlowFailure(run_id=identity, node_id=failure.node_id, reason=str(failure)),
+        )
+        try:
+            await self.runner._execute(step_call)
+        except Exception as exc:
+            log.exception("flow on_fail handler %s failed for %s", node.id, identity)
+            await self.put(
+                identity, node.id, 1, status="failed", error=f"{type(exc).__name__}: {exc}", finished_at=self.clock()
+            )
+            return
+        await self.put(identity, node.id, 1, status="succeeded", finished_at=self.clock())
+
     async def node(self, job: Job[Any, Any], identity: str, node: _Node, env: Env) -> Stored | None | Parked:
         match node:
             case _StepNode():
@@ -608,16 +657,62 @@ class _Execution:
                 return await self.sleep_node(job, identity, node, env)
             case _MapNode():
                 return await self.map_node(job, identity, node, env)
+            case _CallNode():
+                return await self.call_node(identity, node, env)
             case _FailNode():
                 await self.begin(identity, node.id, 1)
                 raise await self.fail(identity, node.id, 1, node.reason)
         assert_never(node)
+
+    async def call_node(self, identity: str, node: _CallNode, env: Env) -> Stored | None | Parked:
+        row = await self.begin(identity, node.id, 1)
+        if row["status"] == "succeeded":
+            return None if node.job.output is None else Stored(node.returns, row["output"])
+        child = str(uuid5(NAMESPACE_URL, json.dumps([identity, node.id, 1])))
+        if node.arg is None:
+            encoded_arg = encode(None, normalize(None))
+        else:
+            arg_stored = env[(node.arg._scope, node.arg._source)]
+            arg_val = decode(arg_stored.encoded, arg_stored.ty)
+            encoded_arg = encode(arg_val, normalize(node.job.input))
+        async with self.child_admissions:
+            self.admitting()
+            created = await self.runner._create(
+                node.job,
+                child,
+                encoded_arg,
+                self.owner[0],
+                owner=self.owner,
+                parent=identity,
+                node=node.id,
+                index=0,
+            )
+        initial_row = {"id": child, "status": "running", "input": encoded_arg} if created else None
+        outcome = await self.job(node.job, child, initial_row=initial_row, fresh=created)
+        if isinstance(outcome, Parked):
+            return outcome
+        if isinstance(outcome, Failed):
+            raise await self.fail(identity, node.id, 1, f"child {child}, {outcome.node_id}: {outcome.reason}")
+        encoded = encode(outcome.value, node.returns) if node.job.output is not None else encode(None, normalize(None))
+        await self.put(
+            identity,
+            node.id,
+            1,
+            status="succeeded",
+            output=encoded,
+            outcome_type=encoded["type"],
+            preview=preview(encoded, self.runner.preview_bytes),
+            finished_at=self.clock(),
+        )
+        return None if node.job.output is None else Stored(node.returns, encoded)
 
     async def step_node(self, job: Job[Any, Any], identity: str, node: _StepNode, env: Env) -> Stored | None | Parked:
         retry = node.retry
         exc_targets = tuple(t for t in retry.targets() if issubclass(t, Exception)) if retry else ()
         val_targets = tuple(t for t in retry.targets() if not issubclass(t, Exception)) if retry else ()
         attempt = 1
+        business_failures = 0
+        deferrals = 0
 
         while True:
             row = self._cached_attempt(identity, node.id, attempt)
@@ -632,6 +727,10 @@ class _Execution:
                     parked = await self.wait(row["due"], identity)
                     if parked is not None:
                         return parked
+                    if row.get("deferred"):
+                        deferrals += 1
+                    else:
+                        business_failures += 1
                     attempt += 1
                     continue
 
@@ -664,8 +763,29 @@ class _Execution:
                     try:
                         value = await self.runner._execute(step_call)
                     except Exception as exc:
-                        if retry is not None and exc_targets and isinstance(exc, exc_targets) and attempt < retry.max:
-                            delay = retry.after.total_seconds() * retry.backoff ** (attempt - 1)
+                        deferred_delay = retry.defer(exc) if (retry is not None and retry.defer is not None) else None
+                        if retry is not None and deferred_delay is not None and deferrals < retry.max_defer:
+                            delay = max(0.0, deferred_delay.total_seconds())
+                            if not math.isfinite(delay):
+                                raise ValueError("defer delay exceeds the supported range") from exc
+                            finished = self.clock()
+                            fields = {
+                                "status": "retried",
+                                "deferred": True,
+                                "error": f"{type(exc).__name__}: {exc}",
+                                "finished_at": finished,
+                                "due": finished + delay,
+                            }
+                        elif (
+                            retry is not None
+                            and exc_targets
+                            and isinstance(exc, exc_targets)
+                            and not retry.is_excluded(exc)
+                            and business_failures + 1 < retry.max
+                        ):
+                            delay = retry.after.total_seconds() * retry.backoff**business_failures
+                            if retry.max_delay is not None:
+                                delay = min(delay, retry.max_delay.total_seconds())
                             if not math.isfinite(delay):
                                 raise ValueError("retry delay exceeds the supported range") from exc
                             finished = self.clock()
@@ -680,9 +800,9 @@ class _Execution:
                             if converter is None:
                                 raise
                             value = await call_sync(converter, exc)
-                            fields = self._finish_value(value, node, retry, val_targets, attempt)
+                            fields = self._finish_value(value, node, retry, val_targets, business_failures)
                     else:
-                        fields = self._finish_value(value, node, retry, val_targets, attempt)
+                        fields = self._finish_value(value, node, retry, val_targets, business_failures)
                 except Exception as exc:
                     await self.runner._notify_error(step_call, exc)
                     raise await self.fail(identity, node.id, attempt, f"{type(exc).__name__}: {exc}") from exc
@@ -699,7 +819,7 @@ class _Execution:
         node: _StepNode,
         retry: Any,
         val_targets: tuple[type[Any], ...],
-        attempt: int,
+        business_failures: int,
     ) -> dict[str, Any]:
         encoded = encode(value, node.returns)
         summary = preview(encoded, self.runner.preview_bytes)
@@ -710,10 +830,12 @@ class _Execution:
             "preview": summary,
             "finished_at": finished,
         }
-        if retry is not None and val_targets and attempt < retry.max:
+        if retry is not None and val_targets and business_failures + 1 < retry.max:
             case = next(iter(selected_type(value, node.returns).alts))
             if case in val_targets:
-                delay = retry.after.total_seconds() * retry.backoff ** (attempt - 1)
+                delay = retry.after.total_seconds() * retry.backoff**business_failures
+                if retry.max_delay is not None:
+                    delay = min(delay, retry.max_delay.total_seconds())
                 if not math.isfinite(delay):
                     raise ValueError("retry delay exceeds the supported range")
                 fields.update(status="retried", due=finished + delay)

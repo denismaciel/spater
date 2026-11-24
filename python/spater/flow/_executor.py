@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 from spater.context import Context
 
-from ._nodes import Job, Ref
+from ._nodes import FlowFailure, Job, Ref
 from ._run_calls import Env, Providers, stored_inputs
 
 
@@ -27,6 +27,7 @@ class StepCall:
     allow_providers: bool
     deadline: float | None = None
     meta: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    failure: FlowFailure | None = None
 
     @property
     def context(self) -> Context:
@@ -73,6 +74,7 @@ class LocalExecutor:
             call.context,
             allow_providers=call.allow_providers,
             deadline=call.deadline,
+            failure=call.failure,
         )
 
     async def aclose(self) -> None:
