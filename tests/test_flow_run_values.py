@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import json
-from typing import Any, NewType, cast
+from typing import Any, Literal, NewType, cast
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
@@ -386,3 +386,31 @@ def test_reorder_nested_pydantic_sets_keeps_original_member_associations() -> No
     assert canonical_input(old, ty) == expected
     old["value"]["group"][0]["ordered"].reverse()
     assert canonical_input(old, ty) != expected
+
+
+@dataclasses.dataclass(frozen=True)
+class WithLiteral:
+    level: Literal["high", "medium", "low"] | None = None
+    flag: Literal[True, 1] = 1
+
+
+def test_literal_roundtrip_and_validation() -> None:
+    from spater.flow._types import assignable, serializable
+
+    ty = normalize(WithLiteral)
+    assert serializable(ty)
+    assert assignable(normalize(Literal["high"]), normalize(Literal["high", "low"]))
+    assert assignable(normalize(Literal["high"]), normalize(str))
+    assert not assignable(normalize(str), normalize(Literal["high"]))
+
+    sample = WithLiteral(level="high", flag=True)
+    raw = encode(sample, ty)
+    assert decode(wire(raw), ty) == sample
+
+    empty = WithLiteral(level=None, flag=1)
+    assert decode(wire(encode(empty, ty)), ty) == empty
+
+    with pytest.raises(RunValueError):
+        encode(WithLiteral(level="nope", flag=1), ty)  # type: ignore[arg-type]
+    with pytest.raises(RunValueError):
+        decode({"type": raw["type"], "value": {"level": "nope", "flag": 1}, "types": raw["types"]}, ty)

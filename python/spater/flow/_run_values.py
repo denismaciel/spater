@@ -71,6 +71,8 @@ def _runtime_type(atom: Any) -> Any:
     if isinstance(atom, ListOf):
         return list
     origin = typing.get_origin(atom)
+    if origin is typing.Literal:
+        return tuple(dict.fromkeys(type(arg) for arg in typing.get_args(atom)))
     if origin in (types.UnionType, typing.Union):
         return tuple(_runtime_type(member) for member in typing.get_args(atom))
     return origin or atom
@@ -213,6 +215,20 @@ class _Codec:
             return self.value(value, normalize(atom.__supertype__), _child(path, "@supertype"))
         if type(atom) is not type:
             origin = typing.get_origin(atom)
+            if origin is typing.Literal:
+                allowed = typing.get_args(atom)
+                if self.reading:
+                    for item in allowed:
+                        if isinstance(item, enum.Enum):
+                            if isinstance(value, str) and value == item.name:
+                                return item
+                        elif type(value) is type(item) and value == item:
+                            return item
+                    raise RunValueError(f"{path or '/'}: expected one of {allowed!r}, got {value!r}")
+                for item in allowed:
+                    if type(value) is type(item) and value == item:
+                        return item.name if isinstance(item, enum.Enum) else value
+                raise RunValueError(f"{path or '/'}: expected one of {allowed!r}, got {value!r}")
             if origin in (dict, collections.abc.Mapping):
                 return self.mapping(value, typing.get_args(atom), path)
             if origin in (tuple, set, frozenset, collections.abc.Sequence):

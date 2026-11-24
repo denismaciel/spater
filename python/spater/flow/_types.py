@@ -110,6 +110,14 @@ def normalize(ann: Any) -> Ty:
         if len(args) != 1:
             raise Unsupported("a list annotation needs one item type")
         return Ty.of(ListOf(normalize(args[0])))
+    if origin is typing.Literal:
+        args = typing.get_args(ann)
+        if not args:
+            raise Unsupported("Literal needs at least one value")
+        for arg in args:
+            if not (arg is None or type(arg) in (str, int, bool) or isinstance(arg, enum.Enum)):
+                raise Unsupported(f"Literal value {arg!r} is not supported")
+        return Ty.of(ann)
     if origin in _OPAQUE:
         for arg in typing.get_args(ann):
             if arg is not Ellipsis:
@@ -131,6 +139,12 @@ def assignable(src: Ty, dst: Ty) -> bool:
 def _atom_fits(a: Any, b: Any) -> bool:
     if a is b or a == b:
         return True
+    if typing.get_origin(a) is typing.Literal:
+        a_args = typing.get_args(a)
+        if typing.get_origin(b) is typing.Literal:
+            b_args = typing.get_args(b)
+            return all(any(type(x) is type(y) and x == y for y in b_args) for x in a_args)
+        return all(_atom_fits(type(x), b) for x in a_args)
     if isinstance(a, ListOf):
         return isinstance(b, ListOf) and assignable(a.item, b.item)
     if isinstance(a, typing.NewType):
@@ -166,6 +180,8 @@ def _atom_serializable(atom: Any, parents: frozenset[type]) -> bool:
             hints = typing.get_type_hints(atom)
             return all(_storable(normalize(hints[f.name]), parents | {atom}) for f in dataclasses.fields(atom))
         return False
+    if typing.get_origin(atom) is typing.Literal:
+        return True
     return all(_storable(normalize(arg), parents) for arg in typing.get_args(atom) if arg is not Ellipsis)
 
 
