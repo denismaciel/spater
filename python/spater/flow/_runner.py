@@ -705,7 +705,7 @@ class _Execution:
             preview=preview(encoded, self.runner.preview_bytes),
             finished_at=self.clock(),
         )
-        return None if node.job.output is None else Stored(node.returns, encoded)
+        return Stored(node.returns, encoded)
 
     async def step_node(self, job: Job[Any, Any], identity: str, node: _StepNode, env: Env) -> Stored | None | Parked:
         retry = node.retry
@@ -719,8 +719,6 @@ class _Execution:
             row = self._cached_attempt(identity, node.id, attempt)
             if row is not None:
                 if row["status"] == "succeeded":
-                    if node.returns == Ty.of(NoneType):
-                        return None
                     return Stored(node.returns, row["output"])
                 if row["status"] == "failed":
                     raise _Failure(node.id, str(row["error"]))
@@ -810,8 +808,6 @@ class _Execution:
 
             await self.put(identity, node.id, attempt, **fields)
             if fields["status"] == "succeeded":
-                if node.returns == Ty.of(NoneType):
-                    return None
                 return Stored(node.returns, fields["output"])
 
     def _finish_value(
