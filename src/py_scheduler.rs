@@ -10,10 +10,8 @@ use pyo3::prelude::*;
 
 use crate::aio::future_into_py;
 use crate::py_base::Secs;
-use crate::py_client::{enqueue_request, PyTaskInfo};
+use crate::py_client::{enqueue_request, resolve_rdb, PyBackend, PyTaskInfo};
 use crate::py_errors::rdb_err;
-use crate::rdb::Rdb;
-use crate::runtime;
 use crate::scheduler::{PostEnqueue, Scheduler};
 
 /// Enqueues tasks periodically. Entries are visible to asynq's Inspector
@@ -26,20 +24,31 @@ pub struct PyScheduler {
 #[pymethods]
 impl PyScheduler {
     #[new]
-    #[pyo3(signature = (url = "redis://127.0.0.1:6379/0", *, location = "UTC", heartbeat_interval = 10.0, post_enqueue = None))]
+    #[pyo3(signature = (
+        url = "redis://127.0.0.1:6379/0",
+        *,
+        location = "UTC",
+        heartbeat_interval = 10.0,
+        post_enqueue = None,
+        pool_size = None,
+        _backend = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         url: &str,
         location: &str,
         heartbeat_interval: f64,
         post_enqueue: Option<Py<PyAny>>,
+        pool_size: Option<usize>,
+        _backend: Option<PyRef<'_, PyBackend>>,
     ) -> PyResult<Self> {
         let tz = Tz::from_str(location).map_err(|e| PyValueError::new_err(e.to_string()))?;
         let heartbeat = Duration::try_from_secs_f64(heartbeat_interval)
             .ok()
             .filter(|d| !d.is_zero())
             .ok_or_else(|| PyValueError::new_err("heartbeat_interval must be > 0"))?;
-        let rdb = runtime::block_on(py, Rdb::connect(url)).map_err(rdb_err)?;
+        let rdb = resolve_rdb(py, url, pool_size, _backend)?;
         let cb: Option<PostEnqueue> = post_enqueue.map(|f| {
             Arc::new(
                 move |entry_id: &str, res: Result<&crate::client::TaskInfo, String>| {
@@ -56,7 +65,7 @@ impl PyScheduler {
             ) as PostEnqueue
         });
         Ok(Self {
-            inner: Arc::new(Scheduler::new(Arc::new(rdb), tz, heartbeat, cb)),
+            inner: Arc::new(Scheduler::new(rdb, tz, heartbeat, cb)),
         })
     }
 

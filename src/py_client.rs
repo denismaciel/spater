@@ -196,6 +196,50 @@ pub(crate) fn enqueue_request(
     })
 }
 
+/// Shared storage handle reused across Client, Inspector, Engine and Scheduler.
+#[pyclass(name = "Backend", module = "spater._core", frozen)]
+pub struct PyBackend {
+    pub(crate) rdb: Arc<Rdb>,
+}
+
+#[pymethods]
+impl PyBackend {
+    #[new]
+    #[pyo3(signature = (url = "redis://127.0.0.1:6379/0", *, pool_size = None))]
+    fn new(py: Python<'_>, url: &str, pool_size: Option<usize>) -> PyResult<Self> {
+        let rdb = connect_rdb(py, url, pool_size)?;
+        Ok(Self { rdb })
+    }
+}
+
+pub(crate) fn connect_rdb(
+    py: Python<'_>,
+    url: &str,
+    pool_size: Option<usize>,
+) -> PyResult<Arc<Rdb>> {
+    if pool_size == Some(0) {
+        return Err(PyValueError::new_err("pool_size must be > 0"));
+    }
+    let rdb =
+        runtime::block_on(py, Rdb::connect_with_pool_size(url, pool_size)).map_err(rdb_err)?;
+    Ok(Arc::new(rdb))
+}
+
+pub(crate) fn resolve_rdb(
+    py: Python<'_>,
+    url: &str,
+    pool_size: Option<usize>,
+    backend: Option<PyRef<'_, PyBackend>>,
+) -> PyResult<Arc<Rdb>> {
+    if pool_size == Some(0) {
+        return Err(PyValueError::new_err("pool_size must be > 0"));
+    }
+    if let Some(b) = backend {
+        return Ok(b.rdb.clone());
+    }
+    connect_rdb(py, url, pool_size)
+}
+
 /// Enqueues tasks. Safe to share between threads and event loops.
 #[pyclass(name = "Client", module = "spater._core", frozen, subclass)]
 pub struct PyClient {
@@ -205,10 +249,15 @@ pub struct PyClient {
 #[pymethods]
 impl PyClient {
     #[new]
-    #[pyo3(signature = (url = "redis://127.0.0.1:6379/0"))]
-    fn new(py: Python<'_>, url: &str) -> PyResult<Self> {
-        let rdb = runtime::block_on(py, Rdb::connect(url)).map_err(rdb_err)?;
-        Ok(Self { rdb: Arc::new(rdb) })
+    #[pyo3(signature = (url = "redis://127.0.0.1:6379/0", *, pool_size = None, _backend = None))]
+    fn new(
+        py: Python<'_>,
+        url: &str,
+        pool_size: Option<usize>,
+        _backend: Option<PyRef<'_, PyBackend>>,
+    ) -> PyResult<Self> {
+        let rdb = resolve_rdb(py, url, pool_size, _backend)?;
+        Ok(Self { rdb })
     }
 
     fn ping(&self, py: Python<'_>) -> PyResult<()> {
@@ -391,6 +440,7 @@ fn memory_advance(url: &str, seconds: f64) -> PyResult<()> {
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyBackend>()?;
     m.add_class::<PyClient>()?;
     m.add_class::<PyTaskInfo>()?;
     m.add_function(wrap_pyfunction!(pg_enqueue_statement, m)?)?;

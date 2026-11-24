@@ -136,9 +136,24 @@ class TaskInfo(Generic[_R_co]):
     @property
     def last_failed_at(self) -> datetime | None: ...
 
+@final
+class Backend:
+    def __new__(
+        cls,
+        url: str = "redis://127.0.0.1:6379/0",
+        *,
+        pool_size: int | None = None,
+    ) -> Self: ...
+
 @disjoint_base
 class Client:
-    def __new__(cls, url: str = "redis://127.0.0.1:6379/0") -> Self: ...
+    def __new__(
+        cls,
+        url: str = "redis://127.0.0.1:6379/0",
+        *,
+        pool_size: int | None = None,
+        _backend: Backend | None = None,
+    ) -> Self: ...
     def ping(self) -> None: ...
     def _aping(self) -> asyncio.Future[None]: ...
     def enqueue(
@@ -217,6 +232,8 @@ class Engine:
         group_max_delay: float = 0.0,
         group_max_size: int = 0,
         failure_policy: Callable[[int, str, TaskMessage], tuple[float, bool]] | None = None,
+        pool_size: int | None = None,
+        _backend: Backend | None = None,
     ) -> Self: ...
     def _astart(self) -> asyncio.Future[None]: ...
     def _anext_events(self, max: int = 256) -> asyncio.Future[list[EngineEvent] | None]: ...
@@ -361,7 +378,13 @@ class SchedulerEnqueueEvent:
 
 @disjoint_base
 class Inspector:
-    def __new__(cls, url: str = "redis://127.0.0.1:6379/0") -> Self: ...
+    def __new__(
+        cls,
+        url: str = "redis://127.0.0.1:6379/0",
+        *,
+        pool_size: int | None = None,
+        _backend: Backend | None = None,
+    ) -> Self: ...
     def queues(self) -> list[str]: ...
     def get_queue_info(self, queue: str) -> QueueInfo: ...
     def history(self, queue: str, days: int = 7) -> list[DailyStats]: ...
@@ -397,6 +420,8 @@ class Scheduler:
         location: str = "UTC",
         heartbeat_interval: float = 10.0,
         post_enqueue: Callable[[str, TaskInfo | None, str | None], None] | None = None,
+        pool_size: int | None = None,
+        _backend: Backend | None = None,
     ) -> Self: ...
     @property
     def id(self) -> str: ...

@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 
 use crate::aio::future_into_py;
 use crate::base::{pb, TaskState};
-use crate::py_client::PyTaskInfo;
+use crate::py_client::{resolve_rdb, PyBackend, PyTaskInfo};
 use crate::py_errors::rdb_err;
 use crate::rdb::inspect::{DailyStats, QueueStats, ServerDetail};
 use crate::rdb::Rdb;
@@ -222,10 +222,15 @@ pub struct PyInspector {
 #[pymethods]
 impl PyInspector {
     #[new]
-    #[pyo3(signature = (url = "redis://127.0.0.1:6379/0"))]
-    fn new(py: Python<'_>, url: &str) -> PyResult<Self> {
-        let rdb = runtime::block_on(py, Rdb::connect(url)).map_err(rdb_err)?;
-        Ok(Self { rdb: Arc::new(rdb) })
+    #[pyo3(signature = (url = "redis://127.0.0.1:6379/0", *, pool_size = None, _backend = None))]
+    fn new(
+        py: Python<'_>,
+        url: &str,
+        pool_size: Option<usize>,
+        _backend: Option<PyRef<'_, PyBackend>>,
+    ) -> PyResult<Self> {
+        let rdb = resolve_rdb(py, url, pool_size, _backend)?;
+        Ok(Self { rdb })
     }
 
     fn queues(&self, py: Python<'_>) -> PyResult<Vec<String>> {

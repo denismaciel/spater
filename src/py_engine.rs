@@ -14,9 +14,8 @@ use crate::engine::{
     default_retry_delay, Config, DefaultPolicy, Engine, Event, FailurePolicy, Outcome,
 };
 use crate::py_base::PyTaskMessage;
+use crate::py_client::{resolve_rdb, PyBackend};
 use crate::py_errors::rdb_err;
-use crate::rdb::Rdb;
-use crate::runtime;
 
 /// Calls `policy(retried, error, msg) -> (delay_seconds, is_failure)` for
 /// failures the engine records without Python's help (lease recovery,
@@ -114,6 +113,8 @@ impl PyEngine {
         group_max_delay = 0.0,
         group_max_size = 0,
         failure_policy = None,
+        pool_size = None,
+        _backend = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -139,6 +140,8 @@ impl PyEngine {
         group_max_delay: f64,
         group_max_size: usize,
         failure_policy: Option<Py<PyAny>>,
+        pool_size: Option<usize>,
+        _backend: Option<PyRef<'_, PyBackend>>,
     ) -> PyResult<Self> {
         let mut cfg = Config::default();
         if let Some(c) = concurrency {
@@ -178,13 +181,13 @@ impl PyEngine {
         cfg.group.max_delay = secs(group_max_delay, "group_max_delay")?;
         cfg.group.max_size = group_max_size;
 
-        let rdb = runtime::block_on(py, Rdb::connect(url)).map_err(rdb_err)?;
+        let rdb = resolve_rdb(py, url, pool_size, _backend)?;
         let policy: Arc<dyn FailurePolicy> = match failure_policy {
             Some(p) => Arc::new(PyPolicy(p)),
             None => Arc::new(DefaultPolicy),
         };
         Ok(Self {
-            engine: Arc::new(Engine::new(Arc::new(rdb), cfg, policy)),
+            engine: Arc::new(Engine::new(rdb, cfg, policy)),
         })
     }
 

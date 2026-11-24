@@ -36,7 +36,9 @@ class Scheduler:
         location: str = "UTC",
         heartbeat_interval: float = 10,
         post_enqueue: PostEnqueue | None = None,
+        pool_size: int | None = None,
         install_signal_handlers: bool = True,
+        _backend: _core.Backend | None = None,
     ):
         cb = None
         if post_enqueue is not None:
@@ -49,6 +51,8 @@ class Scheduler:
             location=location,
             heartbeat_interval=seconds(heartbeat_interval),
             post_enqueue=cb,
+            pool_size=pool_size,
+            _backend=_backend,
         )
         self._install_signals = install_signal_handlers
 

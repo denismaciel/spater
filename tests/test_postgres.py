@@ -122,3 +122,39 @@ def test_bad_url_raises_broker_error():
     with pytest.raises(spater.PostgresError) as e:
         spater.Client("postgresql://nobody@127.0.0.1:1/db")
     assert isinstance(e.value, spater.BrokerError)
+
+
+async def test_shared_pool_limits_connections_and_wakes_multiple_workers(pg_url, run_app):
+    sep = "&" if "?" in pg_url else "?"
+    tagged_url = f"{pg_url}{sep}application_name=spater_shared_pool_test"
+    app = Asynq(tagged_url, pool_size=2)
+    woke_a = asyncio.Event()
+    woke_b = asyncio.Event()
+
+    @app.task("ping_a")
+    async def ping_a() -> None:
+        woke_a.set()
+
+    @app.task("ping_b")
+    async def ping_b() -> None:
+        woke_b.set()
+
+    # Two workers + client + inspector share one pool (size 2) + one LISTEN connection.
+    async with (
+        run_app(app, queues={"qa": 1}, task_check_interval=10),
+        run_app(app, queues={"qb": 1}, task_check_interval=10),
+    ):
+        await asyncio.sleep(0.5)
+        start = time.monotonic()
+        await ping_a.aenqueue(queue="qa")
+        await ping_b.aenqueue(queue="qb")
+        await asyncio.wait_for(asyncio.gather(woke_a.wait(), woke_b.wait()), 3)
+        assert time.monotonic() - start < 1.5
+        _ = app.inspector.queues()
+        with psycopg.connect(pg_url) as conn:
+            row = conn.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'spater_shared_pool_test'"
+            ).fetchone()
+            assert row is not None
+            # pool_size=2 + 1 shared LISTEN connection = 3 max
+            assert 1 <= row[0] <= 3

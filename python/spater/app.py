@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import functools
 import inspect
+import threading
 import typing
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import timedelta
@@ -28,6 +29,7 @@ from typing import (
     overload,
 )
 
+from spater import _core
 from spater._core import TaskInfo
 from spater.client import Client
 from spater.context import TaskContext
@@ -259,8 +261,12 @@ class Asynq:
         lifespan: Lifespan | None = None,
         retry_delay: RetryDelayFunc | None = None,
         is_failure: Callable[[BaseException], bool] | None = None,
+        pool_size: int | None = None,
     ):
+        if pool_size is not None and pool_size <= 0:
+            raise ValueError("pool_size must be > 0")
         self.redis_url = redis_url
+        self._pool_size = pool_size
         self.tasks: dict[str, TaskDef[Any, Any]] = {}
         self._middleware: list[Middleware] = []
         self._error_handlers: list[ErrorHandler] = []
@@ -270,20 +276,38 @@ class Asynq:
         self._retry_delay = retry_delay
         self._is_failure = is_failure
         self._group_aggregator: Callable[..., Any] | None = None
+        self._backend_lock = threading.Lock()
+        self._backend: _core.Backend | None = None
         self._client: Client | None = None
         self._inspector: Inspector | None = None
         self.periodic_entries: list[Any] = []
 
+    def _ensure_backend_locked(self) -> _core.Backend:
+        if self._backend is None:
+            self._backend = _core.Backend(self.redis_url, pool_size=self._pool_size)
+        return self._backend
+
+    def _shared_backend(self) -> _core.Backend:
+        backend = self._backend
+        if backend is None:
+            with self._backend_lock:
+                backend = self._ensure_backend_locked()
+        return backend
+
     @property
     def client(self) -> Client:
         if self._client is None:
-            self._client = Client(self.redis_url)
+            with self._backend_lock:
+                if self._client is None:
+                    self._client = Client(self.redis_url, _backend=self._ensure_backend_locked())
         return self._client
 
     @property
     def inspector(self) -> Inspector:
         if self._inspector is None:
-            self._inspector = Inspector(self.redis_url)
+            with self._backend_lock:
+                if self._inspector is None:
+                    self._inspector = Inspector(self.redis_url, _backend=self._ensure_backend_locked())
         return self._inspector
 
     # -- registration --------------------------------------------------------
@@ -413,6 +437,8 @@ class Asynq:
         """A `Worker` for this app; options as for `Worker`."""
         options.setdefault("redis_url", self.redis_url)
         options.setdefault("retry_delay", self._retry_delay_for)
+        if options["redis_url"] == self.redis_url and "pool_size" not in options and "_backend" not in options:
+            options["_backend"] = self._shared_backend()
         if self._is_failure is not None:
             options.setdefault("is_failure", self._is_failure)
         if self._error_handlers:
@@ -442,6 +468,8 @@ class Asynq:
         from spater.scheduler import Scheduler
 
         options.setdefault("redis_url", self.redis_url)
+        if options["redis_url"] == self.redis_url and "pool_size" not in options and "_backend" not in options:
+            options["_backend"] = self._shared_backend()
         sched = Scheduler(**options)
         for e in self.periodic_entries:
             sched.register(e.cronspec, e.task.name, *e.task.message(e.payload, **e.options))

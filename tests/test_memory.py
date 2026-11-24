@@ -235,3 +235,47 @@ async def test_group_grace_period_follows_the_clock(memory_url, run_app):
 def test_advance_time_needs_a_memory_broker():
     with pytest.raises(ValueError, match="memory://"):
         testing.advance_time("redis://localhost:6379/0", 1)
+
+
+def test_pool_size_validation_and_shared_backend(memory_url):
+    from spater import _core
+    from spater.scheduler import Scheduler
+    from spater.worker import Worker
+
+    with pytest.raises(ValueError, match="pool_size"):
+        Asynq(memory_url, pool_size=0)
+    with pytest.raises(ValueError, match="pool_size"):
+        _core.Backend(memory_url, pool_size=0)
+    with pytest.raises(ValueError, match="pool_size"):
+        spater.Client(memory_url, pool_size=0)
+    with pytest.raises(ValueError, match="pool_size"):
+        Inspector(memory_url, pool_size=0)
+    with pytest.raises(ValueError, match="pool_size"):
+        Worker(lambda ctx: None, redis_url=memory_url, pool_size=0)
+    with pytest.raises(ValueError, match="pool_size"):
+        Scheduler(memory_url, pool_size=0)
+
+    app = Asynq(memory_url, pool_size=2)
+    _ = app.client
+    _ = app.inspector
+    w1 = app.worker(queues={"q1": 1})
+    w2 = app.worker(queues={"q2": 1})
+    w_custom = app.worker(queues={"q3": 1}, pool_size=4)
+    assert app._backend is not None
+    assert w1._backend is app._backend
+    assert w2._backend is app._backend
+    assert w_custom._backend is None
+
+
+async def test_shared_backend_runs_multiple_workers(memory_url, run_app):
+    app = Asynq(memory_url, pool_size=2)
+    seen: list[str] = []
+
+    @app.task("work")
+    async def work(label: str) -> None:
+        seen.append(label)
+
+    async with run_app(app, queues={"a": 1}), run_app(app, queues={"b": 1}):
+        await work.aenqueue("from-a", queue="a")
+        await work.aenqueue("from-b", queue="b")
+        await wait_for(lambda: sorted(seen) == ["from-a", "from-b"], timeout=5)

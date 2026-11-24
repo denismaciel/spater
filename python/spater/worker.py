@@ -121,7 +121,9 @@ class Worker:
         janitor_interval: Seconds = 8,
         janitor_batch_size: int = 100,
         thread_pool_size: int | None = None,
+        pool_size: int | None = None,
         install_signal_handlers: bool = True,
+        _backend: _core.Backend | None = None,
         **engine_options: Any,
     ):
         if isinstance(queues, (list, tuple)):
@@ -136,6 +138,8 @@ class Worker:
         self._group_aggregator = group_aggregator
         self._install_signals = install_signal_handlers
         self._redis_url = redis_url
+        self._db_pool_size = pool_size
+        self._backend = _backend
         opts: dict[str, Any] = {k: seconds(v) if isinstance(v, timedelta) else v for k, v in engine_options.items()}
         self._engine = _core.Engine(
             redis_url,
@@ -153,6 +157,8 @@ class Worker:
             janitor_interval=seconds(janitor_interval),
             janitor_batch_size=janitor_batch_size,
             failure_policy=_weak_policy(self),
+            pool_size=pool_size,
+            _backend=_backend,
             **opts,
         )
         self._pool_size = thread_pool_size or self._engine.concurrency * 2
@@ -404,7 +410,7 @@ class Worker:
         try:
             agg = await maybe_await(self._group_aggregator(group, tasks))
             if self._client is None:
-                self._client = Client(self._redis_url)
+                self._client = Client(self._redis_url, pool_size=self._db_pool_size, _backend=self._backend)
             opts: dict[str, Any] = {"queue": queue, **agg.options}
             await self._client.aenqueue(agg.type, agg.payload, headers=agg.headers, **opts)
             await self._engine._acomplete_aggregation(queue, group, set_id)

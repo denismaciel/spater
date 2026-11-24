@@ -169,8 +169,19 @@ const INSERT_TASK: &str = "
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
     ON CONFLICT DO NOTHING";
 
+pub const DEFAULT_POOL_SIZE: usize = 16;
+
 impl PgRdb {
     pub async fn connect(url: &str) -> Result<Self> {
+        Self::connect_with_pool_size(url, None).await
+    }
+
+    pub async fn connect_with_pool_size(url: &str, pool_size: Option<usize>) -> Result<Self> {
+        let max_size = match pool_size {
+            Some(0) => return Err(Error::Postgres("pool_size must be > 0".into())),
+            Some(n) => n,
+            None => DEFAULT_POOL_SIZE,
+        };
         let config: Config = url.parse()?;
         let tls = tls();
         let manager = Manager::from_config(
@@ -181,7 +192,7 @@ impl PgRdb {
             },
         );
         let pool = Pool::builder(manager)
-            .max_size(16)
+            .max_size(max_size)
             .runtime(Runtime::Tokio1)
             .create_timeout(Some(Duration::from_secs(5)))
             .wait_timeout(Some(Duration::from_secs(10)))
@@ -835,11 +846,13 @@ async fn listen(
                     "LISTEN {PENDING_CHANNEL}; LISTEN {CANCEL_CHANNEL}"
                 ))
                 .await?;
+            pending.notify_waiters();
             pending.notify_one();
             while let Some(n) = rx.recv().await {
                 if n.channel() == CANCEL_CHANNEL {
                     let _ = cancels.send(n.payload().to_string());
                 } else {
+                    pending.notify_waiters();
                     pending.notify_one();
                 }
             }

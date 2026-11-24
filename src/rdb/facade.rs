@@ -57,8 +57,12 @@ pub fn is_postgres_url(url: &str) -> bool {
 
 impl Rdb {
     pub async fn connect(url: &str) -> Result<Self> {
+        Self::connect_with_pool_size(url, None).await
+    }
+
+    pub async fn connect_with_pool_size(url: &str, pool_size: Option<usize>) -> Result<Self> {
         let backend = if is_postgres_url(url) {
-            Backend::Postgres(PgRdb::connect(url).await?)
+            Backend::Postgres(PgRdb::connect_with_pool_size(url, pool_size).await?)
         } else if is_memory_url(url) {
             Backend::Memory(MemoryRdb::connect(url).await?)
         } else {
