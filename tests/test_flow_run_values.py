@@ -411,6 +411,6 @@ def test_literal_roundtrip_and_validation() -> None:
     assert decode(wire(encode(empty, ty)), ty) == empty
 
     with pytest.raises(RunValueError):
-        encode(WithLiteral(level="nope", flag=1), ty)  # type: ignore[arg-type]
+        encode(WithLiteral(level=cast(Any, "nope"), flag=1), ty)
     with pytest.raises(RunValueError):
         decode({"type": raw["type"], "value": {"level": "nope", "flag": 1}, "types": raw["types"]}, ty)
