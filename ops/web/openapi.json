@@ -1,0 +1,1125 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Spater Ops",
+    "description": "Local workflow inspection and execution API.",
+    "license": {
+      "name": ""
+    },
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/api/v1/runs": {
+      "get": {
+        "tags": [
+          "runs"
+        ],
+        "operationId": "listRuns",
+        "parameters": [
+          {
+            "name": "rerun_of",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Status"
+            }
+          },
+          {
+            "name": "workflow",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Earliest start time, in Unix seconds.",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "description": "Latest start time, in Unix seconds.",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}": {
+      "get": {
+        "tags": [
+          "runs"
+        ],
+        "operationId": "getRun",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}/children": {
+      "get": {
+        "tags": [
+          "runs"
+        ],
+        "operationId": "listChildren",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "node",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Status"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}/rerun": {
+      "post": {
+        "tags": [
+          "runs"
+        ],
+        "operationId": "rerun",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RerunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LaunchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/workflows": {
+      "get": {
+        "tags": [
+          "workflows"
+        ],
+        "operationId": "listWorkflows",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowList"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/workflows/{name}": {
+      "get": {
+        "tags": [
+          "workflows"
+        ],
+        "operationId": "getWorkflow",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/workflows/{name}/launch": {
+      "post": {
+        "tags": [
+          "workflows"
+        ],
+        "operationId": "launchWorkflow",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LaunchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LaunchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Attempt": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "attempt",
+          "status"
+        ],
+        "properties": {
+          "arm": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "attempt": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "deadline": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "due": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "input_preview": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Preview"
+              }
+            ]
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "preview": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Preview"
+              }
+            ]
+          },
+          "started_at": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "Comparison": {
+        "type": "object",
+        "required": [
+          "source_status",
+          "input_changed",
+          "input_changes",
+          "more_input_changes",
+          "definition_changed",
+          "steps"
+        ],
+        "properties": {
+          "definition_changed": {
+            "type": "boolean"
+          },
+          "input_changed": {
+            "type": "boolean"
+          },
+          "input_changes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InputChange"
+            }
+          },
+          "more_input_changes": {
+            "type": "boolean"
+          },
+          "source_failure": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_node": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_status": {
+            "$ref": "#/components/schemas/Status"
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StepChange"
+            }
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string"
+          }
+        }
+      },
+      "Graph": {
+        "type": "object",
+        "required": [
+          "nodes",
+          "edges"
+        ],
+        "properties": {
+          "edges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GraphEdge"
+            }
+          },
+          "nodes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GraphNode"
+            }
+          }
+        }
+      },
+      "GraphEdge": {
+        "type": "object",
+        "required": [
+          "src",
+          "dst"
+        ],
+        "properties": {
+          "dst": {
+            "type": "string"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "src": {
+            "type": "string"
+          }
+        }
+      },
+      "GraphNode": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "label"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        }
+      },
+      "InputChange": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "after": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "before": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "JSON text, or absent when the field did not exist."
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "InputField": {
+        "type": "object",
+        "required": [
+          "name",
+          "kind",
+          "required"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        }
+      },
+      "LaunchRequest": {
+        "type": "object",
+        "required": [
+          "input"
+        ],
+        "properties": {
+          "input": {}
+        },
+        "additionalProperties": false
+      },
+      "LaunchResponse": {
+        "type": "object",
+        "required": [
+          "run_id"
+        ],
+        "properties": {
+          "run_id": {
+            "type": "string"
+          }
+        }
+      },
+      "NodeConfig": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "callable": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "retry": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeout": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Preview": {
+        "type": "object",
+        "required": [
+          "value",
+          "truncated",
+          "original_bytes",
+          "omitted_root"
+        ],
+        "properties": {
+          "omitted_root": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "original_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "value": {}
+        }
+      },
+      "RerunRequest": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/LaunchRequest"
+          },
+          {
+            "$ref": "#/components/schemas/SavedInput"
+          }
+        ]
+      },
+      "RunDetail": {
+        "type": "object",
+        "required": [
+          "run",
+          "graph",
+          "attempts",
+          "input"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Attempt"
+            }
+          },
+          "comparison": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Comparison"
+              }
+            ]
+          },
+          "graph": {
+            "$ref": "#/components/schemas/Graph"
+          },
+          "input": {},
+          "input_json": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result": {},
+          "run": {
+            "$ref": "#/components/schemas/RunSummary"
+          }
+        }
+      },
+      "RunPage": {
+        "type": "object",
+        "required": [
+          "items",
+          "total"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RunSummary"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "RunSummary": {
+        "type": "object",
+        "required": [
+          "id",
+          "workflow",
+          "version",
+          "status",
+          "started_at"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "id": {
+            "type": "string"
+          },
+          "item_index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "item_summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent_node": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rerun_of": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_at": {
+            "type": "number",
+            "format": "double",
+            "description": "Unix timestamp in seconds."
+          },
+          "status": {
+            "$ref": "#/components/schemas/Status"
+          },
+          "version": {
+            "type": "string"
+          },
+          "wake_at": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "workflow": {
+            "type": "string"
+          }
+        }
+      },
+      "SavedInput": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "Status": {
+        "type": "string",
+        "enum": [
+          "running",
+          "cancelling",
+          "cancelled",
+          "failed",
+          "succeeded"
+        ]
+      },
+      "StepChange": {
+        "type": "object",
+        "required": [
+          "node"
+        ],
+        "properties": {
+          "after": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Attempt"
+              }
+            ]
+          },
+          "before": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Attempt"
+              }
+            ]
+          },
+          "node": {
+            "type": "string"
+          }
+        }
+      },
+      "WorkflowDetail": {
+        "type": "object",
+        "required": [
+          "workflow",
+          "graph",
+          "definition",
+          "example_input",
+          "nodes"
+        ],
+        "properties": {
+          "definition": {},
+          "example_input": {},
+          "example_note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "graph": {
+            "$ref": "#/components/schemas/Graph"
+          },
+          "input_fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InputField"
+            }
+          },
+          "nodes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NodeConfig"
+            }
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowSummary"
+          }
+        }
+      },
+      "WorkflowList": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowSummary"
+            }
+          }
+        }
+      },
+      "WorkflowSummary": {
+        "type": "object",
+        "required": [
+          "name",
+          "version",
+          "input_type",
+          "output_type",
+          "launchable"
+        ],
+        "properties": {
+          "input_type": {
+            "type": "string"
+          },
+          "latest": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunSummary"
+              }
+            ]
+          },
+          "launch_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "launchable": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "output_type": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

@@ -35,6 +35,18 @@ jobs:
           echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
       - run: make check
       - run: make test
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "24"
+      - name: Verify operations API and browser client
+        working-directory: ops/web
+        run: |
+          cargo test --locked --manifest-path ../api/Cargo.toml
+          npm ci
+          npm run check:openapi
+          npm run build
+          npx playwright install --with-deps chromium
+          npm run test:e2e
       - run: make release-check
       - name: Free-threaded tests
         run: |

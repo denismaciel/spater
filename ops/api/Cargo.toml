@@ -1,0 +1,15 @@
+[package]
+name = "spater-ops-api"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+utoipa = "5"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
