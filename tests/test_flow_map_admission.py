@@ -44,6 +44,7 @@ async def block(index: int, control: Control) -> str:
 def track_root(runner: Runner, monkeypatch: pytest.MonkeyPatch) -> list[str]:
     roots: list[str] = []
     create = runner.store.create
+    create_and_claim = runner.store.create_and_claim
 
     async def track(row: dict[str, Any], *args: Any, **kwargs: Any) -> bool:
         created = await create(row, *args, **kwargs)
@@ -51,7 +52,14 @@ def track_root(runner: Runner, monkeypatch: pytest.MonkeyPatch) -> list[str]:
             roots.append(row["id"])
         return created
 
+    async def track_claim(row: dict[str, Any], *args: Any, **kwargs: Any) -> int:
+        gen = await create_and_claim(row, *args, **kwargs)
+        if row["id"] == row["root_id"]:
+            roots.append(row["id"])
+        return gen
+
     monkeypatch.setattr(runner.store, "create", track)
+    monkeypatch.setattr(runner.store, "create_and_claim", track_claim)
     return roots
 
 

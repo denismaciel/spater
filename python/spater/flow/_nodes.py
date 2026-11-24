@@ -965,12 +965,17 @@ class Job(Generic[InT, OutT]):
     _root: _Scope = field(repr=False, compare=False)
     _signatures: Signatures = field(repr=False, compare=False)
     _definition_json: str = field(init=False, repr=False, compare=False)
+    _digest: str = field(init=False, repr=False, compare=False)
+    _graph_cache: Graph | None = field(init=False, default=None, repr=False, compare=False)
+    _graph_dict_cache: dict[str, Any] | None = field(init=False, default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         from ._json import job_to_dict
 
         definition = job_to_dict(self)
-        object.__setattr__(self, "_definition_json", json.dumps(definition, sort_keys=True))
+        encoded = json.dumps(definition, sort_keys=True)
+        object.__setattr__(self, "_definition_json", encoded)
+        object.__setattr__(self, "_digest", hashlib.sha256(encoded.encode()).hexdigest())
 
     @staticmethod
     def define(name: str, *, provides: Sequence[PerWorker | PerStep] = ()) -> _JobDecorator:
@@ -987,16 +992,27 @@ class Job(Generic[InT, OutT]):
 
     def graph(self) -> Graph:
         """Nodes and edges, for drawing: `job.graph().to_mermaid()`."""
-        from ._graph import project
+        if self._graph_cache is None:
+            from ._graph import project
 
-        return project(self)
+            object.__setattr__(self, "_graph_cache", project(self))
+        assert self._graph_cache is not None
+        return self._graph_cache
+
+    def _graph_dict(self) -> dict[str, Any]:
+        if self._graph_dict_cache is None:
+            from dataclasses import asdict
+
+            object.__setattr__(self, "_graph_dict_cache", asdict(self.graph()))
+        assert self._graph_dict_cache is not None
+        return self._graph_dict_cache
 
     @property
     def digest(self) -> str:
         """Full SHA-256 hex digest of the definition snapshot."""
-        return hashlib.sha256(self._definition_json.encode()).hexdigest()
+        return self._digest
 
     @property
     def version(self) -> str:
         """Short hash of the definition's shape and signatures. Function bodies are not part of it."""
-        return self.digest[:12]
+        return self._digest[:12]

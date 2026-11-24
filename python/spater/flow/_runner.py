@@ -10,7 +10,7 @@ import logging
 import math
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, overload
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -146,6 +146,7 @@ class Runner:
         try:
             await self.executor.aclose()
         finally:
+            self._inspector = None
             await self.store.aclose()
 
     def validate(self, job: Job[Any, Any], input: Any) -> Any:
@@ -164,7 +165,7 @@ class Runner:
         await self._create(job, identity, data, identity, rerun_of=rerun_of)
         return identity
 
-    async def _create(
+    def _build_run(
         self,
         job: Job[Any, Any],
         identity: str,
@@ -173,12 +174,10 @@ class Runner:
         *,
         rerun_of: str | None = None,
         broker_queue: str | None = None,
-        owner: tuple[str, int] | None = None,
         parent: str | None = None,
         node: str | None = None,
         index: int | None = None,
-        fail_if_exists: bool = False,
-    ) -> bool:
+    ) -> dict[str, Any]:
         run: dict[str, Any] = {
             "id": identity,
             "definition": job.digest,
@@ -195,7 +194,35 @@ class Runner:
         }
         if broker_queue is not None:
             run.update(broker_queue=broker_queue, delivery={"expected": identity})
-        definition, graph = job.to_json(), asdict(job.graph())
+        return run
+
+    async def _create(
+        self,
+        job: Job[Any, Any],
+        identity: str,
+        data: Any,
+        root: str,
+        *,
+        rerun_of: str | None = None,
+        broker_queue: str | None = None,
+        owner: tuple[str, int] | None = None,
+        parent: str | None = None,
+        node: str | None = None,
+        index: int | None = None,
+        fail_if_exists: bool = False,
+    ) -> bool:
+        run = self._build_run(
+            job,
+            identity,
+            data,
+            root,
+            rerun_of=rerun_of,
+            broker_queue=broker_queue,
+            parent=parent,
+            node=node,
+            index=index,
+        )
+        definition, graph = job.to_json(), job._graph_dict()
         try:
             return await self.store.create(run, definition, owner=owner, graph=graph, fail_if_exists=fail_if_exists)
         except InputConflict as conflict:
@@ -338,10 +365,12 @@ class Runner:
         fail_if_exists: bool = False,
     ) -> Succeeded[OutT] | Failed:
         identity = str(uuid4()) if run_id is None else run_id
+        run = self._build_run(job, identity, data, identity, rerun_of=rerun_of)
 
         async def start() -> _Execution:
-            await self._create(job, identity, data, identity, rerun_of=rerun_of, fail_if_exists=fail_if_exists)
-            generation = await self.store.claim(identity)
+            generation = await self.store.create_and_claim(
+                run, job.to_json(), graph=job._graph_dict(), fail_if_exists=fail_if_exists
+            )
             return _Execution(self, (identity, generation), False)
 
         admission = asyncio.create_task(start())
@@ -371,7 +400,7 @@ class Runner:
 
         try:
             execution = await asyncio.shield(admission)
-            work = asyncio.create_task(execution.job(job, identity))
+            work = asyncio.create_task(execution.job(job, identity, initial_row=run, fresh=True))
             result = await asyncio.shield(work)
             assert not isinstance(result, Parked)
             return result
@@ -392,6 +421,7 @@ class _Execution:
         self.child_admissions = asyncio.Semaphore(runner.concurrency)
         self.stopping = False
         self.failure: _Failure | None = None
+        self._attempts: dict[str, dict[tuple[str, int], dict[str, Any]]] = {}
 
     def clock(self) -> float:
         return self.store.clock()
@@ -402,8 +432,15 @@ class _Execution:
         if self.stopping:
             raise asyncio.CancelledError
 
-    async def job(self, job: Job[Any, OutT], identity: str) -> Succeeded[OutT] | Failed | Parked:
-        row = await self.store.get(identity)
+    async def job(
+        self,
+        job: Job[Any, OutT],
+        identity: str,
+        *,
+        initial_row: dict[str, Any] | None = None,
+        fresh: bool = False,
+    ) -> Succeeded[OutT] | Failed | Parked:
+        row = initial_row if initial_row is not None else await self.store.get(identity)
         output_ty = normalize(job.output)
         if identity == self.owner[0] and row.get("pending_failure"):
             row = await self.store.finish_failure(identity, self.owner, self.clock())
@@ -415,6 +452,13 @@ class _Execution:
             if row["status"] == "cancelling":
                 await self.store.update(identity, {"status": "cancelled", "finished_at": self.clock()}, self.owner)
             raise asyncio.CancelledError
+
+        if identity not in self._attempts:
+            if fresh:
+                self._attempts[identity] = {}
+            else:
+                loaded = await self.store.attempts_with_payload(identity)
+                self._attempts[identity] = {(a["node_id"], int(a["attempt"])): a for a in loaded}
 
         env: dict[tuple[int, str], Stored] = {}
         if job.input is not None:
@@ -430,6 +474,7 @@ class _Execution:
                 value = decode(final.encoded, final.ty)
             encoded = encode(value, output_ty)
         except _Failure:
+            self._attempts.pop(identity, None)
             if identity != self.owner[0]:
                 raise
             row = await self.store.finish_failure(identity, self.owner, self.clock())
@@ -437,13 +482,24 @@ class _Execution:
         await self.store.update(
             identity, {"status": "succeeded", "finished_at": self.clock(), "result": encoded}, self.owner
         )
+        self._attempts.pop(identity, None)
         return Succeeded(identity, decode(encoded, output_ty))
+
+    def _cached_attempt(self, identity: str, node: str, attempt: int) -> dict[str, Any] | None:
+        return self._attempts[identity].get((node, attempt))
 
     async def put(self, identity: str, node: str, attempt: int, **fields: Any) -> None:
         await self.store.put_attempt(identity, node, attempt, fields, self.owner)
+        bucket = self._attempts.setdefault(identity, {})
+        key = (node, attempt)
+        existing = bucket.get(key)
+        if existing is None:
+            bucket[key] = {"run_id": identity, "node_id": node, "attempt": attempt, **fields}
+        else:
+            bucket[key] = existing | fields
 
     async def begin(self, identity: str, node: str, attempt: int) -> dict[str, Any]:
-        row = await self.store.attempt(identity, node, attempt)
+        row = self._cached_attempt(identity, node, attempt)
         if row is None:
             self.admitting()
             row = {"status": "running", "started_at": self.clock()}
@@ -564,7 +620,7 @@ class _Execution:
         attempt = 1
 
         while True:
-            row = await self.store.attempt(identity, node.id, attempt)
+            row = self._cached_attempt(identity, node.id, attempt)
             if row is not None:
                 if row["status"] == "succeeded":
                     if node.returns == Ty.of(NoneType):
@@ -669,7 +725,7 @@ class _Execution:
         self, job: Job[Any, Any], identity: str, node: _BranchNode, env: Env
     ) -> Stored | None | Parked:
         subject_stored = env[(node.subject._scope, node.subject._source)]
-        row = await self.store.attempt(identity, node.id, 1)
+        row = self._cached_attempt(identity, node.id, 1)
         if row is not None and row["status"] == "succeeded":
             chosen_cls = next(cls for cls in node.arms if _case_ref(cls) == row["arm"])
         else:
@@ -700,18 +756,42 @@ class _Execution:
         return Stored(node.returns, encode(value, node.returns))
 
     async def sleep_node(self, job: Job[Any, Any], identity: str, node: _SleepNode, env: Env) -> None | Parked:
-        row = await self.begin(identity, node.id, 1)
-        if row["status"] == "succeeded":
-            return None
-        if "due" not in row:
+        row = self._cached_attempt(identity, node.id, 1)
+        if row is not None:
+            if row["status"] == "failed":
+                raise _Failure(node.id, str(row["error"]))
+            if row["status"] == "succeeded":
+                return None
+        if row is None or "due" not in row:
             try:
-                if not isinstance(node.duration, timedelta):
-                    await self.put(
-                        identity,
-                        node.id,
-                        1,
-                        input_preview=preview({"value": stored_inputs(node.bound, env)}, self.runner.preview_bytes),
-                    )
+                if isinstance(node.duration, timedelta):
+                    self.admitting()
+                    started = self.clock() if row is None else row["started_at"]
+                    due = started + node.duration.total_seconds()
+                    if row is None:
+                        await self.put(identity, node.id, 1, status="running", started_at=started, due=due)
+                    else:
+                        await self.put(identity, node.id, 1, due=due)
+                else:
+                    if row is None:
+                        self.admitting()
+                        started = self.clock()
+                        await self.put(
+                            identity,
+                            node.id,
+                            1,
+                            status="running",
+                            started_at=started,
+                            input_preview=preview({"value": stored_inputs(node.bound, env)}, self.runner.preview_bytes),
+                        )
+                    else:
+                        started = row["started_at"]
+                        await self.put(
+                            identity,
+                            node.id,
+                            1,
+                            input_preview=preview({"value": stored_inputs(node.bound, env)}, self.runner.preview_bytes),
+                        )
                     async with self.slots:
                         self.admitting()
                         delta = await self.runner._execute(
@@ -726,16 +806,14 @@ class _Execution:
                                 allow_providers=False,
                             )
                         )
-                else:
-                    delta = node.duration
-                if not isinstance(delta, timedelta):
-                    raise TypeError("duration function must return timedelta")
-                due = row["started_at"] + delta.total_seconds()
+                    if not isinstance(delta, timedelta):
+                        raise TypeError("duration function must return timedelta")
+                    due = started + delta.total_seconds()
+                    await self.put(identity, node.id, 1, due=due)
             except _Failure:
                 raise
             except Exception as exc:
                 raise await self.fail(identity, node.id, 1, str(exc)) from exc
-            await self.put(identity, node.id, 1, due=due)
         else:
             due = row["due"]
         parked = await self.wait(due, identity)
@@ -745,22 +823,27 @@ class _Execution:
         return None
 
     async def map_node(self, job: Job[Any, Any], identity: str, node: _MapNode, env: Env) -> Stored | None | Parked:
-        row = await self.begin(identity, node.id, 1)
+        row = self._cached_attempt(identity, node.id, 1)
         ty = Ty.of(ListOf(normalize(node.job.output)))
-        if row["status"] == "succeeded":
-            return None if node.job.output is None else Stored(ty, row["output"])
+        if row is not None:
+            if row["status"] == "failed":
+                raise _Failure(node.id, str(row["error"]))
+            if row["status"] == "succeeded":
+                return None if node.job.output is None else Stored(ty, row["output"])
         items_ty = node.items._ty
-        if "manifest" not in row:
+        if row is None or "manifest" not in row:
             try:
                 items_stored = env[(node.items._scope, node.items._source)]
                 manifest = items_stored.encoded
-                await self.put(
-                    identity,
-                    node.id,
-                    1,
-                    input_preview=preview({"value": {"items": manifest["value"]}}, self.runner.preview_bytes),
-                    manifest=manifest,
-                )
+                fields: dict[str, Any] = {
+                    "input_preview": preview({"value": {"items": manifest["value"]}}, self.runner.preview_bytes),
+                    "manifest": manifest,
+                }
+                if row is None:
+                    self.admitting()
+                    fields["status"] = "running"
+                    fields["started_at"] = self.clock()
+                await self.put(identity, node.id, 1, **fields)
             except _Failure:
                 raise
             except Exception as exc:
@@ -785,22 +868,29 @@ class _Execution:
         return None if node.job.output is None else Stored(ty, encoded)
 
     async def map_children(self, identity: str, node: _MapNode, items: list[Any]) -> list[Any] | Parked:
+        item_ty = normalize(node.job.input)
+
         async def drive(index: int, fresh: bool) -> Succeeded[Any] | Parked:
             child = str(uuid5(NAMESPACE_URL, json.dumps([identity, node.id, 1, index])))
+            initial_row: dict[str, Any] | None = None
+            created = False
             if fresh:
                 async with self.child_admissions:
                     self.admitting()
-                    await self.runner._create(
+                    encoded_item = encode(items[index], item_ty)
+                    created = await self.runner._create(
                         node.job,
                         child,
-                        encode(items[index], normalize(node.job.input)),
+                        encoded_item,
                         self.owner[0],
                         owner=self.owner,
                         parent=identity,
                         node=node.id,
                         index=index,
                     )
-            outcome = await self.job(node.job, child)
+                    if created:
+                        initial_row = {"id": child, "status": "running", "input": encoded_item}
+            outcome = await self.job(node.job, child, initial_row=initial_row, fresh=created)
             if isinstance(outcome, Failed):
                 raise await self.fail(identity, node.id, 1, f"child {child}, {outcome.node_id}: {outcome.reason}")
             return outcome

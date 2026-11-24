@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import math
 import time
 from collections.abc import Sequence
@@ -258,4 +259,10 @@ class FlowQueue:
 
     async def aclose(self) -> None:
         """Release resources acquired by this queue's worker."""
-        await self.runner.aclose()
+        try:
+            with contextlib.suppress(ValueError):
+                self._app._worker_maintenance.remove(self._reconcile)
+            if self._app.tasks.get("spater.flow.deliver") is self._task:
+                del self._app.tasks["spater.flow.deliver"]
+        finally:
+            await self.runner.aclose()

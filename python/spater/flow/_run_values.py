@@ -8,12 +8,18 @@ import enum
 import inspect
 import json
 import math
+import re
 import types
 import typing
 from collections import deque
 from typing import Any
 
-from ._types import ListOf, Ty, normalize
+from ._types import ListOf, NoneType, Ty, normalize
+
+_ENCODER = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+_SORTED_ENCODER = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False, sort_keys=True)
+_PLAIN_ASCII_RE = re.compile(r"\A[\x20-\x21\x23-\x5b\x5d-\x7e]*\Z")
+_DC_FIELDS: dict[type, dict[str, Ty]] = {}
 
 
 class RunValueError(ValueError):
@@ -21,15 +27,30 @@ class RunValueError(ValueError):
 
 
 def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    return _ENCODER.encode(value)
 
 
 def _order_key(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False, sort_keys=True)
+    return _SORTED_ENCODER.encode(value)
+
+
+def _str_size(value: str) -> int:
+    if _PLAIN_ASCII_RE.match(value):
+        return len(value) + 2
+    return len(_ENCODER.encode(value).encode("utf-8"))
 
 
 def _size(value: Any) -> int:
-    return len(_json(value).encode("utf-8"))
+    t = type(value)
+    if t is str:
+        return _str_size(value)
+    if value is None:
+        return 4
+    if t is bool:
+        return 4 if value else 5
+    if t is int:
+        return len(str(value))
+    return len(_ENCODER.encode(value).encode("utf-8"))
 
 
 def _child(path: str, key: str | int) -> str:
@@ -95,7 +116,7 @@ def encode(value: Any, ty: Ty) -> dict[str, Any]:
         atom = _select(value, ty, "")
         raw = codec.atom(value, atom, "")
         # Reject invalid Unicode, non-finite numbers and out-of-range JSON integers before admission.
-        _size(raw)
+        _ENCODER.encode(raw).encode("utf-8")
         result = {"type": _tag(atom), "value": raw}
         if codec.tags:
             result["types"] = codec.tags
@@ -124,7 +145,6 @@ def _read(data: Any, ty: Ty, *, order_sets: bool) -> Any:
             "",
             "invalid value envelope",
         )
-        _size(data["value"])
         tags = data.get("types", {})
         _require(isinstance(tags, dict), "", "invalid variant map")
         codec = _Codec(reading=True, tags=dict(tags), legacy_tags=tags if order_sets else None)
@@ -144,7 +164,7 @@ class _Codec:
         self.reading = reading
         self.tags = {} if tags is None else tags
         self.legacy_tags = legacy_tags
-        self.fields: dict[type, dict[str, Ty]] = {}
+        self.fields = _DC_FIELDS
 
     def value(self, value: Any, ty: Ty, path: str) -> Any:
         if len(ty.alts) == 1:
@@ -157,16 +177,45 @@ class _Codec:
         return self.atom(value, atom, path)
 
     def atom(self, value: Any, atom: Any, path: str) -> Any:
-        if isinstance(atom, typing.NewType):
-            return self.value(value, normalize(atom.__supertype__), _child(path, "@supertype"))
+        if atom is str:
+            t = type(value)
+            if t is str:
+                return value
+            _require(isinstance(value, str), path, f"expected str, got {t.__name__}")
+            return str.__str__(value)
+        if atom is int:
+            t = type(value)
+            if t is int or t is bool:
+                return value
+            _require(isinstance(value, int), path, f"expected int, got {t.__name__}")
+            return int(value)
+        if atom is bool:
+            if type(value) is bool:
+                return value
+            raise RunValueError(f"{path or '/'}: expected bool, got {type(value).__name__}")
+        if atom is float:
+            t = type(value)
+            if t is float and math.isfinite(value):
+                return value
+            _require(isinstance(value, float), path, f"expected float, got {t.__name__}")
+            return _plain(float(value), path)
+        if atom is NoneType:
+            if value is None:
+                return None
+            raise RunValueError(f"{path or '/'}: expected None, got {type(value).__name__}")
         if isinstance(atom, ListOf):
             _require(isinstance(value, list), path, "expected a list")
             return [self.value(item, atom.item, _child(path, i)) for i, item in enumerate(value)]
-        origin = typing.get_origin(atom)
-        if origin is dict:
-            return self.mapping(value, typing.get_args(atom), path)
-        if origin in (tuple, set, frozenset):
-            return self.sequence(value, origin, typing.get_args(atom), path)
+        if isinstance(atom, typing.NewType):
+            return self.value(value, normalize(atom.__supertype__), _child(path, "@supertype"))
+        if type(atom) is not type:
+            origin = typing.get_origin(atom)
+            if origin is dict:
+                return self.mapping(value, typing.get_args(atom), path)
+            if origin in (tuple, set, frozenset):
+                return self.sequence(value, origin, typing.get_args(atom), path)
+        if dataclasses.is_dataclass(atom):
+            return self.record(value, atom, path)
         if issubclass(atom, enum.Flag):
             if self.reading:
                 _require(type(value) is int, path, f"expected {atom.__name__} bits")
@@ -200,23 +249,17 @@ class _Codec:
             if type(value) is atom:
                 raw = value.model_dump(**options)
             else:
-                # Serialize the declared schema when a subclass has additional fields.
                 from pydantic import TypeAdapter
 
                 raw = TypeAdapter[Any](atom).dump_python(
                     value, mode="json", round_trip=True, by_alias=by_alias, warnings="error"
                 )
             raw = _order_model_sets(value, raw, by_alias=by_alias)
-            _read_model(atom, raw)  # Also check model_construct() and instances mutated after validation.
+            _read_model(atom, raw)
             return raw
-        if dataclasses.is_dataclass(atom):
-            return self.record(value, atom, path)
         _require(isinstance(value, atom), path, f"expected {_tag(atom)}, got {type(value).__name__}")
-        if atom is int and type(value) is bool:
-            return value  # bool is assignable to int and JSON retains the distinction.
         if type(value) is not atom:
-            # A str-mixin Enum may override __str__ while carrying a different string value.
-            value = str.__str__(value) if atom is str else atom(value)
+            value = atom(value)
         return _plain(value, path)
 
     def record(self, value: Any, cls: Any, path: str) -> Any:
@@ -406,14 +449,20 @@ def _plain(value: Any, path: str) -> Any:
     raise RunValueError(f"{path or '/'}: expected a JSON value")
 
 
-def _placeholder(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {}
-    if isinstance(value, list):
-        return []
-    if isinstance(value, str):
-        return ""
-    return value if _size(value) <= 4 else None
+def _placeholder(value: Any) -> tuple[Any, int]:
+    t = type(value)
+    if t is dict:
+        return {}, 2
+    if t is list:
+        return [], 2
+    if t is str:
+        return "", 2
+    if value is None:
+        return None, 4
+    if t is bool:
+        return value, (4 if value else 5)
+    size = _size(value)
+    return (value, size) if size <= 4 else (None, 4)
 
 
 def _shares(needs: list[int], available: int) -> list[int]:
@@ -434,21 +483,57 @@ def _shares(needs: list[int], available: int) -> list[int]:
 
 def _key_budget(value: Any) -> int:
     """Additional bytes needed to show an object's immediate keys."""
-    if not isinstance(value, dict):
+    if type(value) is not dict:
         return 0
-    return sum(_size(k) + 1 + _size(_placeholder(v)) for k, v in value.items()) + max(0, len(value) - 1)
+    return sum(_str_size(k) + 1 + _placeholder(v)[1] for k, v in value.items()) + max(0, len(value) - 1)
 
 
 def _prefix(value: str, budget: int) -> str:
-    # Each codepoint needs at least one JSON byte and the surrounding quotes need two.
+    if budget <= 2:
+        return ""
+    if _PLAIN_ASCII_RE.match(value):
+        return value[: budget - 2]
     low, high = 0, min(len(value), budget - 2)
     while low < high:
         middle = (low + high + 1) // 2
-        if _size(value[:middle]) <= budget:
+        if _str_size(value[:middle]) <= budget:
             low = middle
         else:
             high = middle - 1
     return value[:low]
+
+
+def _compute_sizes(root: Any) -> dict[int, int]:
+    """Memoize exact compact UTF-8 JSON byte sizes for every container/string subtree once."""
+    memo: dict[int, int] = {}
+
+    def measure(node: Any) -> int:
+        t = type(node)
+        if t is str:
+            key = id(node)
+            if key not in memo:
+                memo[key] = _str_size(node)
+            return memo[key]
+        if node is None:
+            return 4
+        if t is bool:
+            return 4 if node else 5
+        if t is int:
+            return len(str(node))
+        if t is list:
+            key = id(node)
+            if key not in memo:
+                memo[key] = 2 + sum(measure(item) for item in node) + max(0, len(node) - 1)
+            return memo[key]
+        if t is dict:
+            key = id(node)
+            if key not in memo:
+                memo[key] = 2 + sum(_str_size(k) + 1 + measure(v) for k, v in node.items()) + max(0, len(node) - 1)
+            return memo[key]
+        return len(_ENCODER.encode(node).encode("utf-8"))
+
+    measure(root)
+    return memo
 
 
 def preview(data: Any, limit: int = 16384) -> dict[str, Any]:
@@ -456,7 +541,15 @@ def preview(data: Any, limit: int = 16384) -> dict[str, Any]:
     if type(limit) is not int or limit < 1:
         raise ValueError("the preview budget must be a positive integer")
     value = data["value"]
-    total = _size(value)
+    sizes = _compute_sizes(value)
+
+    def size_of(node: Any) -> int:
+        cached = sizes.get(id(node))
+        if cached is not None:
+            return cached
+        return _size(node)
+
+    total = size_of(value)
     result = {"value": value, "truncated": total > limit, "original_bytes": total, "omitted_keys": 0}
     if total <= limit:
         return result
@@ -465,20 +558,20 @@ def preview(data: Any, limit: int = 16384) -> dict[str, Any]:
     pending: deque[tuple[Any, Any, Any, int]] = deque([(value, result, "value", limit)])
     while pending:
         source, parent, index, budget = pending.popleft()
-        if _size(source) <= budget:
+        src_size = size_of(source)
+        if src_size <= budget:
             parent[index] = source
-        elif isinstance(source, str) and budget >= 2:
+        elif type(source) is str and budget >= 2:
             parent[index] = _prefix(source, budget)
-        elif isinstance(source, (list, dict)) and budget >= 2:
-            obj = isinstance(source, dict)
+        elif type(source) in (list, dict) and budget >= 2:
+            obj = type(source) is dict
             target: Any = {} if obj else []
             parent[index] = target
             remaining = budget - 2
             children = []
-            for key, child in source.items() if isinstance(source, dict) else enumerate(source):
-                placeholder = _placeholder(child)
-                base = _size(placeholder)
-                cost = base + int(bool(target)) + (_size(key) + 1 if obj else 0)
+            for key, child in source.items() if obj else enumerate(source):
+                placeholder, base = _placeholder(child)
+                cost = base + int(bool(target)) + (_str_size(key) + 1 if isinstance(key, str) else 0)
                 if cost > remaining:
                     if obj:
                         if parent is result:
@@ -490,11 +583,9 @@ def preview(data: Any, limit: int = 16384) -> dict[str, Any]:
                 else:
                     target.append(placeholder)
                 remaining -= cost
-                need = _size(child) - base
+                need = size_of(child) - base
                 if need > 0:
                     children.append((child, key, base, need))
-            # Prioritize the next level of object keys across all siblings. Divide the
-            # remaining payload space across strings, arrays and deeper structures.
             floors = _shares([_key_budget(c) for c, _, _, _ in children], remaining)
             extra = _shares([need - floor for (_, _, _, need), floor in zip(children, floors)], remaining - sum(floors))
             for (child, key, base, _), floor, bonus in zip(children, floors, extra):

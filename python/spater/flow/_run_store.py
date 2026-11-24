@@ -135,15 +135,15 @@ class _DB:
             with contextlib.closing(self.conn.cursor()) as cursor:
                 cursor.executemany(sql if isinstance(self.conn, sqlite3.Connection) else sql.replace("?", "%s"), batch)
 
-    def locked_row(self, sql: LiteralString, params: tuple[Any, ...]) -> tuple[Any, ...] | None:
+    def locked_row(self, sql: LiteralString, params: tuple[Any, ...], *, share: bool = False) -> tuple[Any, ...] | None:
         if not isinstance(self.conn, sqlite3.Connection):
-            sql += " FOR UPDATE"
+            sql += " FOR SHARE" if share else " FOR UPDATE"
         return self.execute(sql, params).fetchone()
 
-    def root(self, owner: Owner) -> str:
+    def root(self, owner: Owner, *, share: bool = False) -> str:
         """Lock the root before reading or modifying any record in its tree."""
         sql = "SELECT generation, status FROM flow_runs WHERE id = ? AND root_id = id"
-        row = self.locked_row(sql, (owner[0],))
+        row = self.locked_row(sql, (owner[0],), share=share)
         if row is None or row[0] != owner[1]:
             raise ClaimLost(f"claim {owner[1]} no longer owns root run {owner[0]!r}")
         return str(row[1])
@@ -214,12 +214,16 @@ class _DB:
         return current
 
 
+_DUMP_ENCODER = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+_SORTED_DUMP_ENCODER = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False, sort_keys=True)
+
+
 def _dump(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    return _DUMP_ENCODER.encode(value)
 
 
 def _lineage(run: Record) -> str:
-    return json.dumps([run.get(k) for k in _IDENTITY if k != "input"], sort_keys=True, allow_nan=False)
+    return _SORTED_DUMP_ENCODER.encode([run.get(k) for k in _IDENTITY if k != "input"])
 
 
 def _read(text: str) -> Record:
@@ -388,6 +392,7 @@ class RunStore:
         self._pool = None if self._memory is not None else _PgPool(url, pool_size)
         self._schema_ready = False
         self._schema_lock = Lock()
+        self._known_defs: set[str] = set()
 
     def close(self) -> None:
         if self._pool is not None:
@@ -447,6 +452,34 @@ class RunStore:
         graph: Record | None = None,
         fail_if_exists: bool = False,
     ) -> bool:
+        return await self._create_row(
+            run, definition_json, owner=owner, graph=graph, fail_if_exists=fail_if_exists, generation=0
+        )
+
+    async def create_and_claim(
+        self,
+        run: Record,
+        definition_json: str,
+        *,
+        graph: Record | None = None,
+        fail_if_exists: bool = False,
+    ) -> int:
+        """Atomically insert a new root run and claim generation 1 in a single transaction."""
+        created = await self._create_row(
+            run, definition_json, owner=None, graph=graph, fail_if_exists=fail_if_exists, generation=1
+        )
+        return 1 if created else await self.claim(run["id"])
+
+    async def _create_row(
+        self,
+        run: Record,
+        definition_json: str,
+        *,
+        owner: Owner | None,
+        graph: Record | None,
+        fail_if_exists: bool,
+        generation: int,
+    ) -> bool:
         if run["definition"] != hashlib.sha256(definition_json.encode()).hexdigest():
             raise ValueError("run definition digest does not match its JSON")
         child = run.get("parent_id") is not None
@@ -454,36 +487,40 @@ class RunStore:
             raise ValueError("a root owns itself and a child requires its parent's claim")
         if child and any(run.get(key) is None for key in ("parent_node", "parent_attempt", "item_index")):
             raise ValueError("a mapped child requires its parent node, attempt and item index")
+        digest = run["definition"]
+        def_known = digest in self._known_defs
 
         def create(db: _DB) -> bool:
             if owner is not None:
-                if db.root(owner) != "running" or run["root_id"] != owner[0]:
+                if db.root(owner, share=True) != "running" or run["root_id"] != owner[0]:
                     raise ClaimLost("cannot admit a child under an inactive or different root")
                 parent = db.run(run["parent_id"])
                 if parent["root_id"] != owner[0] or parent["status"] != "running":
                     raise ClaimLost("parent is inactive or belongs to a different root")
-            db.execute(
-                """INSERT INTO flow_definitions (digest, definition_json, graph_json) VALUES (?, ?, ?)
-                          ON CONFLICT (digest) DO NOTHING""",
-                (run["definition"], definition_json, None if graph is None else _dump(graph)),
-            )
-            if graph is not None:
+            if not def_known:
                 db.execute(
-                    "UPDATE flow_definitions SET graph_json = ? WHERE digest = ? AND graph_json IS NULL",
-                    (_dump(graph), run["definition"]),
+                    """INSERT INTO flow_definitions (digest, definition_json, graph_json) VALUES (?, ?, ?)
+                              ON CONFLICT (digest) DO NOTHING""",
+                    (digest, definition_json, None if graph is None else _dump(graph)),
                 )
+                if graph is not None:
+                    db.execute(
+                        "UPDATE flow_definitions SET graph_json = ? WHERE digest = ? AND graph_json IS NULL",
+                        (_dump(graph), digest),
+                    )
             inserted = db.execute(
                 """INSERT INTO flow_runs
-                (id, root_id, definition, parent_id, parent_node, parent_attempt, item_index, status, record, workflow_key, started_at, rerun_source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+                (id, root_id, definition, parent_id, parent_node, parent_attempt, item_index, generation, status, record, workflow_key, started_at, rerun_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
                 (
                     run["id"],
                     run["root_id"],
-                    run["definition"],
+                    digest,
                     run.get("parent_id"),
                     run.get("parent_node"),
                     run.get("parent_attempt"),
                     run.get("item_index"),
+                    generation,
                     run["status"],
                     _dump(run),
                     _dump(run["job"]),
@@ -501,11 +538,15 @@ class RunStore:
                 raise ValueError("mapped item already belongs to a different child run") from None
             if _lineage(prior) != _lineage(run):
                 raise ValueError(f"run {run['id']!r} already exists with different input, definition or lineage")
-            if json.dumps(prior.get("input"), sort_keys=True) != json.dumps(run.get("input"), sort_keys=True):
+            if _SORTED_DUMP_ENCODER.encode(prior.get("input")) != _SORTED_DUMP_ENCODER.encode(run.get("input")):
                 raise InputConflict(run["id"], prior.get("input"))
             return False
 
-        return await self._transaction(create)
+        created = await self._transaction(create)
+        if not def_known and graph is not None:
+            with self._schema_lock:
+                self._known_defs.add(digest)
+        return created
 
     async def get(self, run_id: str) -> Record:
         return await self._transaction(lambda db: db.run(run_id))
@@ -739,9 +780,10 @@ class RunStore:
     async def update(self, run_id: str, fields: Record, owner: Owner) -> None:
         if any(key in fields for key in _IDENTITY):
             raise ValueError("cannot update run identity fields")
+        is_child = run_id != owner[0]
 
         def update(db: _DB) -> None:
-            root_status = db.root(owner)
+            root_status = db.root(owner, share=is_child)
             run = db.run(run_id)
             if run["root_id"] != owner[0]:
                 raise ClaimLost("run belongs to a different root")
@@ -752,7 +794,7 @@ class RunStore:
             status = fields.get("status", run["status"])
             if root_status == "cancelling" and status not in ("cancelling", "cancelled"):
                 raise ClaimLost("root cancellation has begun")
-            if run_id == owner[0] and run.get("pending_failure") is not None:
+            if not is_child and run.get("pending_failure") is not None:
                 if status == "failed":
                     db.finish_failure(run, fields["finished_at"])
                     return
@@ -765,7 +807,7 @@ class RunStore:
                 db.write_run(run)
                 return
             db.terminalize(run)
-            if run_id == owner[0] and status in ("failed", "cancelled"):
+            if not is_child and status in ("failed", "cancelled"):
                 db.cancel_descendants(run_id, run["finished_at"])
 
         await self._transaction(update)
@@ -799,13 +841,16 @@ class RunStore:
     async def put_attempt(self, run_id: str, node_id: str, attempt: int, fields: Record, owner: Owner) -> None:
         if any(key in fields for key in _ATTEMPT_KEY):
             raise ValueError("cannot update attempt identity fields")
+        is_failure = fields.get("status") == "failed"
 
         def put(db: _DB) -> None:
-            if db.root(owner) != "running":
+            if db.root(owner, share=not is_failure) != "running":
                 raise ClaimLost("root is closed to new work")
-            run = db.run(run_id)
-            if run["root_id"] != owner[0] or run["status"] != "running":
-                raise ClaimLost("run is inactive or belongs to a different root")
+            run: Record | None = None
+            if run_id != owner[0]:
+                run = db.run(run_id)
+                if run["root_id"] != owner[0] or run["status"] != "running":
+                    raise ClaimLost("run is inactive or belongs to a different root")
             key = run_id, node_id, attempt
             row = db.execute(
                 "SELECT record, payload FROM flow_node_runs WHERE run_id = ? AND node_id = ? AND attempt = ?", key
@@ -820,8 +865,8 @@ class RunStore:
                 (*key, _dump(record), _dump(payload) if payload else None),
             )
 
-            if fields.get("status") == "failed":
-                root = run if run_id == owner[0] else db.run(owner[0])
+            if is_failure:
+                root = db.run(owner[0])
                 if root.get("pending_failure") is None:
                     root["pending_failure"] = {"run_id": run_id, "node_id": node_id, "error": fields["error"]}
                     db.write_run(root)
@@ -830,6 +875,15 @@ class RunStore:
 
     async def attempts(self, run_id: str) -> list[Record]:
         return await self._transaction(lambda db: db.attempts(run_id))
+
+    async def attempts_with_payload(self, run_id: str) -> list[Record]:
+        def load(db: _DB) -> list[Record]:
+            rows = db.execute(
+                "SELECT record, payload FROM flow_node_runs WHERE run_id = ? ORDER BY node_id, attempt", (run_id,)
+            )
+            return [_read(record) | (_read(payload) if payload is not None else {}) for record, payload in rows]
+
+        return await self._transaction(load)
 
     async def children(self, run_id: str) -> list[Record]:
         def get(db: _DB) -> list[Record]:

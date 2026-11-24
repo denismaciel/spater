@@ -364,15 +364,15 @@ async def test_repeated_cancellation_during_admission_closes_run(url, monkeypatc
         return f.step(key, n)
 
     async with Runner(url) as runner:
-        claim = runner.store.claim
+        create_and_claim = runner.store.create_and_claim
 
-        async def hold_claim(identity):
-            generation = await claim(identity)
-            admitted.set_result(identity)
+        async def hold_claim(run, *args, **kwargs):
+            generation = await create_and_claim(run, *args, **kwargs)
+            admitted.set_result(run["id"])
             await release_claim.wait()
             return generation
 
-        monkeypatch.setattr(runner.store, "claim", hold_claim)
+        monkeypatch.setattr(runner.store, "create_and_claim", hold_claim)
         work = asyncio.create_task(runner.run(job, 1))
         identity = await asyncio.wait_for(admitted, 4)
         try:
@@ -767,3 +767,22 @@ def test_step_meta_validation_and_version_sensitivity():
             return f.step(inc, n, meta={"bad": object()})
 
     assert exc.value.codes == {"bad-option"}
+
+
+async def test_aclose_detaches_flow_queue_hooks_and_clears_runner_inspector(memory_url):
+    from spater.app import Asynq
+    from spater.flow import FlowQueue
+
+    @Job.define("noop")
+    def noop(f: Builder, n: Ref[int]) -> Ref[str]:
+        return f.step(key, n)
+
+    app = Asynq(memory_url)
+    queue = FlowQueue(app, [noop])
+    assert queue._reconcile in app._worker_maintenance
+    assert "spater.flow.deliver" in app.tasks
+    queue.runner._inspector = app.inspector
+    await queue.aclose()
+    assert queue._reconcile not in app._worker_maintenance
+    assert "spater.flow.deliver" not in app.tasks
+    assert queue.runner._inspector is None
