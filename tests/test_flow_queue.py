@@ -625,3 +625,27 @@ async def test_queue_forwards_middleware_and_on_error(flow_url, run_app):
         assert observed_err == [("explode", "failed-9")]
     finally:
         await queue.aclose()
+
+
+async def test_cancel_active_run_does_not_fail_precondition(memory_url, run_app):
+    started = asyncio.Event()
+
+    async def block_forever(req: Request) -> None:
+        started.set()
+        await asyncio.sleep(req.seconds)
+
+    @Job.define("active_cancel_job")
+    def job(f: Builder, req: Ref[Request]) -> None:
+        f.step(block_forever, req)
+
+    app = Asynq(memory_url)
+    queue = FlowQueue(app, [job])
+    run_id = await queue.enqueue(job, Request(60))
+    try:
+        async with run_app(app):
+            await asyncio.wait_for(started.wait(), timeout=5.0)
+            await queue.cancel(run_id)
+            row = await wait_terminal(queue.runner.store, run_id)
+        assert row["status"] == "cancelled"
+    finally:
+        await queue.aclose()

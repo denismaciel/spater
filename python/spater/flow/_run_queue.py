@@ -15,7 +15,13 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 from spater._core import TaskInfo
 from spater.app import Asynq
 from spater.context import TaskContext
-from spater.errors import HandlerNotFound, QueueNotFoundError, TaskIDConflictError, TaskNotFoundError
+from spater.errors import (
+    FailedPreconditionError,
+    HandlerNotFound,
+    QueueNotFoundError,
+    TaskIDConflictError,
+    TaskNotFoundError,
+)
 from spater.inspector import Inspector
 
 from ._executor import StepErrorHandler, StepExecutor, StepMiddleware
@@ -221,7 +227,7 @@ class FlowQueue:
                 pass
             try:
                 await asyncio.to_thread(self._app.inspector.delete_task, broker_queue, expected)
-            except (TaskNotFoundError, QueueNotFoundError):
+            except (TaskNotFoundError, QueueNotFoundError, FailedPreconditionError):
                 pass
 
     async def _deliver(self, delivery: _Delivery, ctx: TaskContext) -> None:
