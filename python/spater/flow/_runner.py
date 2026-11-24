@@ -46,13 +46,14 @@ log = logging.getLogger(__name__)
 
 InT = TypeVar("InT")
 OutT = TypeVar("OutT")
+OutT_co = TypeVar("OutT_co", covariant=True)
 T = TypeVar("T")
 
 
 @dataclass(frozen=True)
-class Succeeded(Generic[OutT]):
+class Succeeded(Generic[OutT_co]):
     run_id: str
-    value: OutT
+    value: OutT_co
 
 
 @dataclass(frozen=True)
