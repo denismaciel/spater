@@ -64,6 +64,117 @@ spater worker tasks:app --processes 4     # one worker server per process
 spater scheduler tasks:app                # enqueues @app.periodic tasks
 ```
 
+## DAG runner
+
+The development checkout includes `spater.flow` for defining, checking, drawing,
+and executing typed DAGs. Business functions stay plain Python with zero Spater
+imports. A wiring module connects them using `@Job.define(...)`, `Builder`, and
+explicit `Ref[T]` handles:
+
+```python
+from datetime import timedelta as td
+from spater.flow import Builder, Job, Ref, Retry, Runner, Succeeded
+
+@Job.define("archived_report")
+def ARCHIVED_REPORT(f: Builder, day: Ref[Day]) -> Ref[Report]:
+    f.step(reports.extract, day)                 # runs concurrently with extract_archive
+    archive = f.step(reports.extract_archive, day)
+    return f.step(reports.transform, day, archive)
+
+async def report():
+    async with Runner("memory://reports", concurrency=4) as runner:
+        result = await runner.run(ARCHIVED_REPORT, Day("2026-11-18"))
+        if isinstance(result, Succeeded):
+            print(result.value)                  # typed as Report
+        history = await runner.inspect(result.run_id)
+        print(history["status"], history["attempts"])
+```
+
+Constructing a `Job` checks all `Ref` scopes, parameter and return types,
+exhaustive `branch` cases, providers (`PerWorker` / `PerStep`), retries, and
+serializability immediately, and captures a read-only definition snapshot for
+`job.to_json()`, `job.version`, and `job.graph()`. Independent steps run
+concurrently up to `concurrency`; pass `after=` when ordering is needed without a
+data dependency. Run a job directly with `Runner` against `memory://<name>` or a
+Postgres DSN (install the `flow-postgres` extra for Postgres).
+
+Pass a deterministic `run_id=` (and `on_duplicate="fail"` or `"use_existing"`)
+to `runner.run(...)` or `queue.enqueue(...)` for idempotent starts, and
+`await runner.cancel(run_id)` / `await queue.cancel(run_id)` to cancel a live run.
+Steps can carry JSON-serializable `meta={...}` hints, and `Runner` / `FlowQueue`
+accept `executor=` (implementing `StepExecutor`, defaulting to `LocalExecutor`),
+`middleware=` / `@runner.middleware`, `on_error=` / `@runner.on_error`, and
+`pool_size=` for pooled Postgres connections.
+
+For background execution, register `queue = FlowQueue(app, [ARCHIVED_REPORT])`
+on the producer and worker apps, importing `FlowQueue` from `spater.flow`.
+`await queue.enqueue(ARCHIVED_REPORT, day)` returns the run ID. The run record
+is available after the first worker claim. Call `await queue.aclose()` at
+shutdown to release worker-scoped providers.
+
+Each broker delivery defaults to a 24-hour timeout and three retries. Set
+`delivery_timeout` and `delivery_max_retry` on `FlowQueue` to change them.
+Delayed continuations inherit the producer's settings, and time spent parked
+doesn't consume the next delivery's timeout. If the delivery needed to continue
+an admitted run is archived or disappears from its queue, worker maintenance
+or `runner.inspect` records a failure at `$delivery`. An earlier committed
+step failure keeps its original cause. Step retries (`Retry(on=..., max=..., after=...)`)
+support both raised exceptions and returned domain outcomes.
+
+The runner commits each step's typed output with its completion. On redelivery,
+it skips committed work and repeats interrupted steps with the same idempotency
+key. A timed step keeps its original deadline across worker loss. If the deadline
+has passed, redelivery records a timeout before invoking the step. External
+services can use the idempotency key to deduplicate side effects. A compatible
+worker can resume a Postgres run after process death. A named memory store lives
+within one process. Inspector previews default to 16 KiB per attempt. Use
+`await runner.graph(run_id)` for the saved graph or
+`await runner.rerun(current_job, run_id)` to start a fresh linked run.
+
+[Example jobs](examples/flows/jobs.py) · [Generated graphs](examples/flows/GRAPHS.md)
+
+### Workflow operations center
+
+Start the local console from the repository root with Node 22.12 or newer,
+Rust, and uv. The demo runs real example jobs in a named in-memory store.
+
+```sh
+uv sync --locked
+npm ci --prefix ops/web
+node ops/dev.mjs --demo
+```
+
+Open [Runs](http://127.0.0.1:3410/runs) to inspect root runs, attempt timing,
+saved graphs, output previews, and mapped children. Open **Workflows** to inspect
+a registered definition or launch it with JSON input. A manual rerun starts all
+steps with the current registered definition. Keep or edit the saved input.
+The source run lists its reruns, and each rerun shows what changed in the input,
+definition, failure, and recorded step outcomes.
+
+To use your own jobs, set `SPATER_OPS_JOBS` to an importable `module:attribute`
+containing a sequence of `Job` definitions and run `node ops/dev.mjs`.
+Set `SPATER_OPS_STORE` to the same PostgreSQL URL as your runner to see runs
+from other processes. The default `memory://spater-ops` store lives in the
+console's Python process. Console launches go to the `spater-ops` queue handled
+by its worker. A queued launch returns its run ID immediately.
+
+The console is a trusted local tool. The web server listens on loopback port
+3410 and the Rust API on loopback port 8410. For remote use, forward the web
+port through SSH. Ctrl-C stops the local services.
+
+Rust handler DTOs define the API contract. Axum serves the utoipa specification
+at [openapi.json](http://127.0.0.1:8410/openapi.json). In `ops/web`, run
+`npm run gen:openapi` to regenerate the checked-in specification and TypeScript
+types, or `npm run check:openapi` to detect drift. The TanStack Start app uses
+those types with `openapi-fetch` and React Query. Its SSR loaders call the Rust
+API directly and browser requests use the same-origin Start route.
+
+For a production build of the local console, run `npm run build` in `ops/web`,
+start `cargo run --locked --manifest-path ops/api/Cargo.toml -- serve` from
+the repository root, and `npm start` from `ops/web`. To run the browser suite
+against that build, use `npx playwright install chromium` and `npm run test:e2e`
+in `ops/web`. The tests start their own API, worker, and web listener.
+
 ## Typing
 
 The package ships type information, including stubs for the Rust extension. Each task's payload and result types come from the handler's signature, so type checkers catch mistakes at the call site:

@@ -34,7 +34,10 @@ def memory_url(name: str | None = None) -> str:
 
 def reset_memory(url: str | None = None) -> None:
     """Empties the in-process broker behind `url`, or every one."""
+    from spater.flow._run_store import reset_memory as reset_flows
+
     _core.memory_reset(url)
+    reset_flows(url)
 
 
 def advance_time(broker: str | Asynq, by: float | timedelta) -> None:
@@ -49,7 +52,10 @@ def advance_time(broker: str | Asynq, by: float | timedelta) -> None:
     if not url.startswith("memory://"):
         raise ValueError(f"advance_time needs a memory:// broker, not {url!r}")
     seconds = by.total_seconds() if isinstance(by, timedelta) else by
+    from spater.flow._run_store import advance_memory
+
     _core.memory_advance(url, seconds)
+    advance_memory(url, seconds)
 
 
 class _InlineRunner:

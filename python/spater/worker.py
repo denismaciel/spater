@@ -132,6 +132,7 @@ class Worker:
         self._is_failure = is_failure or (lambda exc: True)
         self._error_handler = error_handler
         self._health_check = health_check
+        self._maintenance: list[Callable[[], Awaitable[None]]] = []
         self._group_aggregator = group_aggregator
         self._install_signals = install_signal_handlers
         self._redis_url = redis_url
@@ -276,6 +277,9 @@ class Worker:
         elif kind == "aggregate":
             self._spawn(self._aggregate(ev[1], ev[2], ev[3], ev[4]))
         elif kind == "health":
+            if ev[1] is None:
+                for hook in self._maintenance:
+                    self._spawn(self._call_user(hook))
             if self._health_check is not None:
                 err = RedisError(ev[1]) if ev[1] else None
                 self._spawn(self._call_user(self._health_check, err))

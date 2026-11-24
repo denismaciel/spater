@@ -1,7 +1,7 @@
 from spater._core import TaskInfo, TaskMessage, version
 from spater.app import Asynq, TaskDecorator, TaskDef, TaskFailed
 from spater.client import Client
-from spater.context import TaskContext, current_task
+from spater.context import Context, TaskContext, current_task
 from spater.errors import (
     AsynqError,
     BrokerError,
@@ -34,6 +34,7 @@ __all__ = [
     "AsynqError",
     "BrokerError",
     "Client",
+    "Context",
     "DeadlineExceeded",
     "DuplicateTaskError",
     "EnqueueOptions",

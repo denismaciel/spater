@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,14 @@ def current_task() -> TaskContext:
         return _current.get()
     except LookupError:
         raise RuntimeError("not running inside a spater task handler") from None
+
+
+@dataclass(frozen=True)
+class Context:
+    """Runtime facts visible to a per-step provider. Retries reuse the idempotency key."""
+
+    run_id: str
+    idempotency_key: str
 
 
 class TaskContext:

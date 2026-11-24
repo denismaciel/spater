@@ -749,6 +749,9 @@ version = "0.5.1"
 source = { editable = "." }
 
 [package.optional-dependencies]
+flow-postgres = [
+    { name = "psycopg" },
+]
 metrics = [
     { name = "prometheus-client" },
 ]
@@ -792,8 +795,9 @@ test = [
 requires-dist = [
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.25" },
     { name = "prometheus-client", marker = "extra == 'metrics'", specifier = ">=0.20" },
+    { name = "psycopg", marker = "extra == 'flow-postgres'", specifier = ">=3.2" },
 ]
-provides-extras = ["metrics", "otel"]
+provides-extras = ["flow-postgres", "metrics", "otel"]
 
 [package.metadata.requires-dev]
 dev = [

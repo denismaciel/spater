@@ -264,6 +264,7 @@ class Asynq:
         self.tasks: dict[str, TaskDef[Any, Any]] = {}
         self._middleware: list[Middleware] = []
         self._error_handlers: list[ErrorHandler] = []
+        self._worker_maintenance: list[Callable[[], Awaitable[None]]] = []
         self._enqueue_hooks: list[Callable[[str, dict[str, str]], None]] = []
         self._lifespan = lifespan
         self._retry_delay = retry_delay
@@ -418,7 +419,9 @@ class Asynq:
             options.setdefault("error_handler", self._on_error)
         if self._group_aggregator is not None:
             options.setdefault("group_aggregator", self._group_aggregator)
-        return Worker(self.handle, **options)
+        worker = Worker(self.handle, **options)
+        worker._maintenance = self._worker_maintenance
+        return worker
 
     @contextlib.asynccontextmanager
     async def _lifespan_cm(self) -> AsyncGenerator[None, None]:

@@ -15,6 +15,7 @@ classifiers = ["Programming Language :: Python :: Free Threading :: 3 - Stable"]
 dependencies = []
 
 [project.optional-dependencies]
+flow-postgres = ["psycopg>=3.2"]
 metrics = ["prometheus-client>=0.20"]
 otel = ["opentelemetry-api>=1.25"]
 
